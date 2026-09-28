@@ -29,7 +29,6 @@ from .beteiligung import berechne_beteiligtenstatus
 # (z.B. AX_Flurstueck, AX_Gebaeude, AX_Grenzpunkt, ...).
 STANDARD_LAYER_AUSWAHL = {
     "AX_Flurstueck",
-    "AX_Gebaeude",
 }
 
 

@@ -11,9 +11,11 @@ aus der rotierenden Palette (FARBPALETTE) und die Standardwerte.
 """
 
 from qgis.core import (
+    QgsCategorizedSymbolRenderer,
     QgsFillSymbol,
     QgsLineSymbol,
     QgsMarkerSymbol,
+    QgsRendererCategory,
     QgsSingleSymbolRenderer,
     QgsWkbTypes,
 )
@@ -40,8 +42,8 @@ STANDARD_PUNKTGROESSE = 2.0   # mm, fuer Punktobjekte
 # farbe: "r,g,b" oder "r,g,b,a" (0-255). breite: Linienbreite/Punktgroesse in mm.
 # Nicht eingetragene Eintraege fallen auf die Standardwerte zurueck.
 LAYER_STILE = {
-    # "AX_Flurstueck": {"farbe": "35,35,35", "breite": 0.6},
-    "AX_BauRaumOderBodenordnungsrecht": {"farbe": "228,26,28", "breite": 2.0},
+    "AX_Flurstueck": {"farbe": "35,35,35", "breite": 0.6},
+    "AX_Gebaeude": {"farbe": "227,26,28", "breite": 0.8},
     # weitere Objektarten hier ergaenzen, z.B.:
     # "AX_Grenzpunkt": {"farbe": "0,0,0", "breite": 1.5},
 }
@@ -95,4 +97,43 @@ def style_layer(layer, tabellenname, index=0):
         return
 
     layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+    layer.triggerRepaint()
+
+
+# Farben des Unterschiede-Layers je vergleichsstatus:
+# (Wert im Feld, Legendentext, "r,g,b" Kontur, "r,g,b,a" Fuellung)
+DIFF_KATEGORIEN = [
+    ("neu", "neu", "46,125,50", "76,175,80,110"),
+    ("entfernt", "entfernt", "198,40,40", "244,67,54,110"),
+    ("geometrie_geaendert", "Geometrie geändert", "230,126,0", "255,167,38,130"),
+    ("attribute_geaendert", "nur Attribute geändert", "84,110,122", "144,164,174,110"),
+    ("geometrie_und_attribute_geaendert", "Geometrie und Attribute geändert", "123,31,162", "171,71,188,130"),
+]
+
+
+def _diff_symbol(geom_typ, kontur, fuellung):
+    if geom_typ == QgsWkbTypes.PolygonGeometry:
+        return QgsFillSymbol.createSimple({
+            "color": fuellung,
+            "outline_style": "solid",
+            "outline_width": "0.7",
+            "outline_color": kontur + ",255",
+        })
+    if geom_typ == QgsWkbTypes.LineGeometry:
+        return QgsLineSymbol.createSimple({"line_width": "1.0", "line_color": kontur + ",255"})
+    return QgsMarkerSymbol.createSimple({"size": "3", "color": fuellung, "outline_color": kontur + ",255"})
+
+
+def style_diff_layer(layer):
+    """Faerbt den Unterschiede-Layer eines Vergleichs nach dem Feld
+    'vergleichsstatus' ein (neu / entfernt / Geometrie geaendert / ...). Die
+    Legende erscheint dadurch automatisch im Layerbaum."""
+    geom_typ = layer.geometryType()
+    kategorien = [
+        QgsRendererCategory(wert, _diff_symbol(geom_typ, kontur, fuellung), text)
+        for wert, text, kontur, fuellung in DIFF_KATEGORIEN
+    ]
+    # Leerer Wert = alle uebrigen Faelle (z.B. kuenftig neue Status)
+    kategorien.append(QgsRendererCategory("", _diff_symbol(geom_typ, "97,97,97", "158,158,158,110"), "sonstige"))
+    layer.setRenderer(QgsCategorizedSymbolRenderer("vergleichsstatus", kategorien))
     layer.triggerRepaint()

@@ -1,6 +1,6 @@
 import sqlite3
 
-from .styling import style_layer
+from .styling import style_diff_layer, style_layer
 
 from qgis.PyQt import sip
 from qgis.PyQt.QtCore import Qt, QVariant
@@ -241,6 +241,8 @@ class VergleichTab(QWidget):
         layer_diff = _memory_layer_erzeugen(
             f"{layer.name()} - Unterschiede {iso_a[:10]} bis {iso_b[:10]}", layer, diff_felder
         )
+        # Unterschiede-Layer nach vergleichsstatus einfaerben (neu/entfernt/...)
+        style_diff_layer(layer_diff)
 
         attr_aenderungen_felder = QgsFields()
         attr_aenderungen_felder.append(QgsField("objektart", QVariant.String))
