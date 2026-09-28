@@ -173,8 +173,14 @@ def oeffne_wertklassen_dialog(iface, plugin):
         )
         return
 
-    dlg = WertklassenDialog(iface, ergebnisse, vergleich["crs"])
+    # Elternfenster = QGIS-Hauptfenster (wie beim Attributaenderungen-Fenster):
+    # ohne Elternfenster faellt das Fenster hinter die Karte, sobald der
+    # Hauptdialog geschlossen wird, und wird nicht sicher von Qt verwaltet.
+    dlg = WertklassenDialog(iface, ergebnisse, vergleich["crs"], iface.mainWindow())
+    dlg.setAttribute(Qt.WA_DeleteOnClose)
     dlg.show()
+    dlg.raise_()
+    dlg.activateWindow()
     return dlg
 
 

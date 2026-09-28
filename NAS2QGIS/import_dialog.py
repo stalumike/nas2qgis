@@ -32,14 +32,36 @@ STANDARD_LAYER_AUSWAHL = {
 }
 
 
+def bereits_geladene_tabellen(gpkg_pfad):
+    """Tabellennamen aus diesem GeoPackage, die schon als Layer im Projekt
+    liegen. Erkannt ueber Dateipfad + Tabellenname der Layer-Quelle, nicht
+    ueber den Layernamen - so wird auch ein umbenannter Layer erkannt."""
+    ziel = os.path.normcase(os.path.abspath(gpkg_pfad))
+    gefunden = set()
+    for layer in QgsProject.instance().mapLayers().values():
+        if not isinstance(layer, QgsVectorLayer) or layer.providerType() != "ogr":
+            continue
+        teile = layer.source().split("|")
+        if os.path.normcase(os.path.abspath(teile[0])) != ziel:
+            continue
+        for teil in teile[1:]:
+            if teil.startswith("layername="):
+                gefunden.add(teil[len("layername="):])
+    return gefunden
+
+
 class LayerAuswahlDialog(QDialog):
     """Checkbox-Liste, um vor dem Laden auszuwaehlen, welche Objektart-Tabellen
     tatsaechlich als Layer ins Projekt sollen.
 
     vorausgewaehlt: Menge/Liste von Tabellennamen, die beim Oeffnen bereits
-    angehakt sein sollen. Ohne Angabe (None) werden alle angehakt."""
+    angehakt sein sollen. Ohne Angabe (None) werden alle angehakt.
 
-    def __init__(self, tabellen, vorausgewaehlt=None, parent=None):
+    bereits_geladen: Tabellennamen, die schon im Projekt liegen - sie werden
+    ausgegraut und abgehakt angezeigt ("bereits geladen") und nie erneut
+    geladen."""
+
+    def __init__(self, tabellen, vorausgewaehlt=None, bereits_geladen=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Layer auswaehlen")
         self.setMinimumSize(340, 440)
@@ -48,11 +70,19 @@ class LayerAuswahlDialog(QDialog):
         layout.addWidget(QLabel("Welche Objektarten sollen geladen werden?"))
 
         self.liste = QListWidget()
+        bereits_geladen = bereits_geladen or set()
         for tabelle in tabellen:
-            item = QListWidgetItem(tabelle)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            angehakt = True if vorausgewaehlt is None else tabelle in vorausgewaehlt
-            item.setCheckState(Qt.Checked if angehakt else Qt.Unchecked)
+            if tabelle in bereits_geladen:
+                item = QListWidgetItem(f"{tabelle}  (bereits geladen)")
+                item.setData(Qt.UserRole, tabelle)
+                item.setFlags(Qt.NoItemFlags)  # ausgegraut, nicht bedienbar
+                item.setCheckState(Qt.Checked)
+            else:
+                item = QListWidgetItem(tabelle)
+                item.setData(Qt.UserRole, tabelle)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                angehakt = True if vorausgewaehlt is None else tabelle in vorausgewaehlt
+                item.setCheckState(Qt.Checked if angehakt else Qt.Unchecked)
             self.liste.addItem(item)
         layout.addWidget(self.liste)
 
@@ -84,13 +114,16 @@ class LayerAuswahlDialog(QDialog):
 
     def _alle_setzen(self, state):
         for i in range(self.liste.count()):
-            self.liste.item(i).setCheckState(state)
+            item = self.liste.item(i)
+            if item.flags() & Qt.ItemIsEnabled:  # bereits geladene bleiben unberuehrt
+                item.setCheckState(state)
 
     def ausgewaehlte_tabellen(self):
         return [
-            self.liste.item(i).text()
+            self.liste.item(i).data(Qt.UserRole)
             for i in range(self.liste.count())
-            if self.liste.item(i).checkState() == Qt.Checked
+            if (self.liste.item(i).flags() & Qt.ItemIsEnabled)
+            and self.liste.item(i).checkState() == Qt.Checked
         ]
 
 
@@ -274,10 +307,19 @@ class ImportTab(QWidget):
             QMessageBox.information(self, "Keine Layer", "Keine Objektart-Tabellen mit Geometrie gefunden.")
             return
 
-        auswahl_dialog = LayerAuswahlDialog(tabellen, vorausgewaehlt=STANDARD_LAYER_AUSWAHL, parent=self)
+        schon_geladen = bereits_geladene_tabellen(self.gpkg_pfad)
+        auswahl_dialog = LayerAuswahlDialog(
+            tabellen, vorausgewaehlt=STANDARD_LAYER_AUSWAHL,
+            bereits_geladen=schon_geladen, parent=self,
+        )
         if auswahl_dialog.exec_() != QDialog.Accepted:
             return
-        ausgewaehlt = auswahl_dialog.ausgewaehlte_tabellen()
+        # Sicherheitsnetz: bereits geladene Tabellen nie erneut laden, auch wenn
+        # sich zwischen Oeffnen und Bestaetigen des Fensters etwas geaendert hat
+        ausgewaehlt = [t for t in auswahl_dialog.ausgewaehlte_tabellen() if t not in bereits_geladene_tabellen(self.gpkg_pfad)]
+        uebersprungen = sorted(schon_geladen & set(tabellen))
+        if uebersprungen:
+            self._log(f"\nBereits geladen (übersprungen): {', '.join(uebersprungen)}")
 
         geladen = 0
         erste_gueltige_crs = None
