@@ -2,7 +2,8 @@ import sqlite3
 
 from .styling import style_layer
 
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt import sip
+from qgis.PyQt.QtCore import Qt, QVariant
 from qgis.PyQt.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -21,6 +22,14 @@ from qgis.core import (
     QgsVectorLayer,
     QgsWkbTypes,
 )
+
+
+NAME_ROLLE = Qt.UserRole + 1  # Layername ohne Status-Zusatz (das Dropdown zeigt ihn mit)
+
+
+def _datum_de(iso):
+    """'2026-06-30T00:00:00Z' -> '30.06.2026'"""
+    return f"{iso[8:10]}.{iso[5:7]}.{iso[:4]}"
 
 
 def _gpkg_path_from_layer(layer):
@@ -82,8 +91,8 @@ class VergleichTab(QWidget):
         layout.addLayout(button_row)
 
         self.attr_button = QPushButton("Attributänderungen anzeigen")
-        self.attr_button.setEnabled(self.plugin.letzte_attributaenderungen is not None)
-        self.attr_button.clicked.connect(self.plugin.zeige_attributaenderungen)
+        self.attr_button.setEnabled(False)
+        self.attr_button.clicked.connect(self._zeige_attributaenderungen)
         layout.addWidget(self.attr_button)
 
         wertklassen_button = QPushButton("Betroffene Wertklassenflächen ermitteln...")
@@ -91,16 +100,54 @@ class VergleichTab(QWidget):
         layout.addWidget(wertklassen_button)
 
         self.layer_combo.currentIndexChanged.connect(self.lieferungen_aktualisieren)
+        self.layer_combo.currentIndexChanged.connect(self._attr_button_aktualisieren)
         self.run_button.clicked.connect(self.vergleichen)
 
         self.layer_liste_befuellen()
         layout.addStretch()
+
+    def _zeige_attributaenderungen(self):
+        layer = self.aktueller_layer()
+        if layer is None:
+            return
+        self.plugin.zeige_attributaenderungen(layer.name())
+
+    def _layername_aus_dropdown(self):
+        idx = self.layer_combo.currentIndex()
+        if idx < 0:
+            return None
+        return self.layer_combo.itemData(idx, NAME_ROLLE)
+
+    def _attr_button_aktualisieren(self):
+        """Beschriftung und Aktivierung richten sich nach dem GERADE gewaehlten
+        Layer (Objektart): aktiv nur, wenn dafuer schon ein Vergleich vorliegt."""
+        name = self._layername_aus_dropdown()
+        if name is None:
+            self.attr_button.setText("Attributänderungen anzeigen")
+            self.attr_button.setEnabled(False)
+            return
+        self.attr_button.setText(f"Attributänderungen anzeigen ({name})")
+        self.attr_button.setEnabled(name in self.plugin.vergleiche)
+
+    def _dropdown_texte_aktualisieren(self):
+        """Zeigt im Layer-Dropdown an, fuer welche Objektarten schon ein
+        Vergleich vorliegt (mit Zeitraum) - ohne die Auswahl zu veraendern."""
+        for i in range(self.layer_combo.count()):
+            name = self.layer_combo.itemData(i, NAME_ROLLE)
+            vergleich = self.plugin.vergleiche.get(name)
+            if vergleich is None:
+                self.layer_combo.setItemText(i, name)
+            else:
+                a, b = vergleich["zeitraum"]
+                self.layer_combo.setItemText(i, f"{name}  ✔  ({_datum_de(a)} → {_datum_de(b)})")
 
     def _oeffne_wertklassen_dialog(self):
         from .wertklassen_dialog import oeffne_wertklassen_dialog
         self._wertklassen_dialog = oeffne_wertklassen_dialog(self.iface, self.plugin)
 
     def layer_liste_befuellen(self):
+        vorher = self._layername_aus_dropdown()
+        self.layer_combo.blockSignals(True)
         self.layer_combo.clear()
         for layer in QgsProject.instance().mapLayers().values():
             # providerType() == "ogr" schliesst unsere eigenen, bei einem
@@ -111,6 +158,15 @@ class VergleichTab(QWidget):
                     and layer.providerType() == "ogr"
                     and layer.fields().indexOf("gueltig_von") >= 0):
                 self.layer_combo.addItem(layer.name(), layer)
+                self.layer_combo.setItemData(self.layer_combo.count() - 1, layer.name(), NAME_ROLLE)
+        self._dropdown_texte_aktualisieren()
+        # Bisherige Auswahl beibehalten (der Reiterwechsel fuellt die Liste
+        # jedes Mal neu - ohne das sprang die Auswahl immer auf den ersten Eintrag)
+        if vorher is not None:
+            idx = self.layer_combo.findData(vorher, NAME_ROLLE)
+            if idx >= 0:
+                self.layer_combo.setCurrentIndex(idx)
+        self.layer_combo.blockSignals(False)
         # Kein Popup hier (mehr): dieser Tab wird beim Oeffnen des
         # Hauptdialogs immer sofort erzeugt, auch wenn der Nutzer nur den
         # Import-Reiter sehen will - ein Meldungsfenster wuerde da unpassend
@@ -118,6 +174,7 @@ class VergleichTab(QWidget):
         # Klick auf "Vergleichen" kommt ohnehin eine Meldung, falls kein
         # Layer gewaehlt ist.
         self.lieferungen_aktualisieren()
+        self._attr_button_aktualisieren()
 
     def aktueller_layer(self):
         return self.layer_combo.currentData()
@@ -274,6 +331,17 @@ class VergleichTab(QWidget):
         layer_diff.dataProvider().addFeatures(diff_features)
         layer_attr.dataProvider().addFeatures(attr_change_features)
 
+        # Die Vergleichs-Layer eines frueheren Vergleichs derselben Objektart
+        # aus dem Projekt entfernen, damit sie sich nicht immer wieder
+        # verdoppeln. Vorher einen evtl. darauf laufenden Blinkvergleich stoppen.
+        alt = self.plugin.vergleiche.get(layer.name())
+        if alt is not None:
+            self.blink_controller.stoppen()
+            for schluessel in ("zustand_a_layer", "zustand_b_layer", "diff_layer", "attr_layer"):
+                alter_layer = alt.get(schluessel)
+                if alter_layer is not None and not sip.isdeleted(alter_layer):
+                    QgsProject.instance().removeMapLayer(alter_layer.id())
+
         for l in (layer_a, layer_b, layer_diff, layer_attr):
             if hasattr(l, "updateExtents"):
                 l.updateExtents()
@@ -285,24 +353,27 @@ class VergleichTab(QWidget):
         # Die Bedienelemente dafuer liegen im Attributaenderungen-Fenster.
         self.blink_controller.layer_setzen(layer_a, layer_b)
 
-        self.plugin.letzte_attributaenderungen = (aenderungen_je_objekt, layer.crs())
-        self.attr_button.setEnabled(True)
-
-        # Fuer die Wertklassenflaechen-Ermittlung merken wir uns den
-        # Differenz-Layer + Objektart + CRS dieses Vergleichs - unabhaengig
-        # davon, welche Objektart verglichen wurde (die Pruefung, ob es
-        # AX_Flurstueck war, erfolgt erst beim tatsaechlichen Aufruf dieser
-        # Funktion, siehe wertklassen_dialog.py).
-        self.plugin.letzter_vergleich = {
-            "objektart": layer.name(),
+        # Ergebnis dieses Vergleichs JE OBJEKTART merken (siehe plugin.vergleiche):
+        # Attributaenderungen-Fenster, Blinkvergleich und Wertklassenflaechen-
+        # Ermittlung greifen darauf zu - ein spaeterer Vergleich einer anderen
+        # Objektart ueberschreibt diesen Eintrag nicht.
+        self.plugin.vergleiche[layer.name()] = {
             "diff_layer": layer_diff,
+            "attr_layer": layer_attr,
             "zustand_a_layer": layer_a,
             "zustand_b_layer": layer_b,
             "crs": layer.crs(),
+            "gpkg_pfad": _gpkg_path_from_layer(layer),
+            "aenderungen": aenderungen_je_objekt,
+            "zeitraum": (iso_a, iso_b),
         }
+        self._dropdown_texte_aktualisieren()
+        self._attr_button_aktualisieren()
 
-        if aenderungen_je_objekt:
-            self.plugin.zeige_attributaenderungen()
+        # Immer neu aufbauen - auch bei 0 Attributaenderungen, damit kein
+        # veraltetes Fenster einer anderen Objektart stehen bleibt (das neue
+        # Fenster zeigt dann einen entsprechenden Leer-Hinweis).
+        self.plugin.zeige_attributaenderungen(layer.name(), neu_aufbauen=True)
 
         self.iface.messageBar().pushSuccess(
             "NAS-Vergleich",

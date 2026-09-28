@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plugins>
+  <pyqgis_plugin name="NAS2QGIS" version="0.6.3">
+    <description>Import von NAS/ALKIS-Lieferungen in ein historisiertes GeoPackage und Vergleich zweier Zeitpunkte</description>
+    <version>0.6.3</version>
+    <qgis_minimum_version>3.16</qgis_minimum_version>
+    <file_name>nas2qgis.zip</file_name>
+    <author_name>STALUMS Abt. 3</author_name>
+    <download_url>file:///O:/STALUMSAbt3/LEFIS-Administration/Code/NAS2QGIS/nas2qgis.zip</download_url>
+    <experimental>False</experimental>
+    <deprecated>False</deprecated>
+    <tags>alkis,nas,kataster,geopackage</tags>
+    <category>Vector</category>
+  </pyqgis_plugin>
+</plugins>

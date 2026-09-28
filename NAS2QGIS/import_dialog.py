@@ -68,6 +68,14 @@ class LayerAuswahlDialog(QDialog):
 
         button_row = QHBoxLayout()
         ok_button = QPushButton("Laden")
+        # Leicht gruen, damit der Button sich von Alle/Keine/Abbrechen abhebt
+        ok_button.setStyleSheet(
+            "QPushButton { background-color: #c8e6c9; border: 1px solid #81c784; "
+            "border-radius: 3px; padding: 4px 12px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #a5d6a7; }"
+            "QPushButton:pressed { background-color: #81c784; }"
+        )
+        ok_button.setDefault(True)
         ok_button.clicked.connect(self.accept)
         cancel_button = QPushButton("Abbrechen")
         cancel_button.clicked.connect(self.reject)

@@ -89,9 +89,14 @@ Flurstücksgrenze verschoben hat.
 1. Es muss **vorher** ein Vergleich für **AX_Flurstueck** durchgeführt
    worden sein (siehe oben) – ein Vergleich einer anderen Objektart zählt
    nicht.
-2. Ein Layer mit den Wertklassenflächen muss im Projekt geladen sein. Diese
-   Daten liefert das Plugin **nicht** selbst – ihr besorgt sie euch über
-   euer separates `lefistogeopackage`-Plugin und ladet sie vorher in QGIS.
+2. Die Wertklassenflächen müssen als GeoPackage `AB-Wertklassenflaechen.gpkg`
+   **im selben Ordner wie das NAS-GeoPackage** des Vergleichs liegen. Diese
+   Daten liefert das Plugin **nicht** selbst – ihr erzeugt sie mit eurem
+   separaten `lefistogeopackage`-Plugin. Das Plugin sucht die Datei beim
+   Klick automatisch dort und öffnet sie intern; ihr müsst sie **nicht** in
+   QGIS laden (sie erscheint auch nicht im Layerbaum). Ist sie schon als
+   Layer im Projekt geladen, wird dieser verwendet. Findet das Plugin die
+   Datei nicht, fragt es, ob ihr sie manuell auswählen wollt.
 
 Fehlt eine der beiden Voraussetzungen, bekommt ihr eine Meldung, die genau
 sagt, was noch fehlt – statt eines leeren oder falschen Ergebnisses.

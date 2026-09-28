@@ -104,6 +104,12 @@ class BlinkController(QObject):
         if self._timer.isActive():
             self._timer.start(intervall_ms)
 
+    def paar_ids(self):
+        """(id_a, id_b) der aktuellen Blink-Layer oder None, falls keine gueltigen."""
+        if not self.hat_gueltige_layer():
+            return None
+        return (self._layer_a.id(), self._layer_b.id())
+
     def ist_aktiv(self):
         return self._timer.isActive()
 

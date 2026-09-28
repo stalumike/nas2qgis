@@ -8,11 +8,14 @@ nicht umgekehrt.
 
 Voraussetzungen, die vor dem Ausfuehren geprueft werden:
   1. Es liegt ein Vergleichsergebnis fuer AX_Flurstueck vor (Differenzlayer
-     der Plugin-Instanz, siehe vergleich_dialog.py -> letzter_vergleich).
-  2. Ein Layer mit den Wertklassenflaechen ist im Projekt geladen (Tabelle
-     'AB-Wertklassenflaechen', vom Nutzer selbst ueber das
-     lefistogeopackage-Plugin bereitgestellt - diese Logik wird hier bewusst
-     NICHT nachgebaut).
+     der Plugin-Instanz, siehe vergleich_dialog.py -> plugin.vergleiche).
+  2. Das GeoPackage mit den Wertklassenflaechen (AB-Wertklassenflaechen.gpkg,
+     vom Nutzer ueber das lefistogeopackage-Plugin erzeugt - diese Logik wird
+     hier bewusst NICHT nachgebaut) wird automatisch im selben Ordner wie das
+     NAS-GeoPackage des Vergleichs gesucht und intern geoeffnet, ohne den Layer
+     ins Projekt zu laden. Ist bereits ein passender Layer im Projekt
+     geladen, wird dieser bevorzugt. Nur wenn nichts gefunden wird, fragt
+     das Plugin nach dem Speicherort.
 
 Nur Differenzobjekte, die tatsaechlich eine geometrische Aenderung darstellen
 (neu, entfernt, geometrisch geaendert) werden verschnitten - reine
@@ -21,6 +24,7 @@ irrelevant.
 """
 
 import csv
+import os
 
 from qgis.PyQt import sip
 from qgis.PyQt.QtCore import Qt
@@ -45,6 +49,7 @@ from qgis.core import (
 )
 
 WERTKLASSEN_TABELLE = "AB-Wertklassenflaechen"
+WERTKLASSEN_DATEINAME = "AB-Wertklassenflaechen.gpkg"
 WERTKLASSEN_OID_FELD = "uuid"
 WERTKLASSEN_WEKL_FELD = "wekl"
 WERTKLASSEN_NUNK_FELD = "nunk"
@@ -55,11 +60,10 @@ WERTKLASSEN_NUNK_FELD = "nunk"
 GEOMETRISCH_RELEVANTE_STATI = {"neu", "entfernt", "geometrie_geaendert", "geometrie_und_attribute_geaendert"}
 
 
-def _diff_layer_gueltig(plugin):
-    letzter = plugin.letzter_vergleich
-    if letzter is None:
+def _diff_layer_gueltig(vergleich):
+    if vergleich is None:
         return False
-    diff_layer = letzter.get("diff_layer")
+    diff_layer = vergleich.get("diff_layer")
     if diff_layer is None or sip.isdeleted(diff_layer):
         return False
     return QgsProject.instance().mapLayer(diff_layer.id()) is not None
@@ -77,44 +81,88 @@ def _finde_wertklassen_layer():
     return None
 
 
+def _oeffne_wertklassen_gpkg(pfad):
+    """Oeffnet die Wertklassenflaechen-Tabelle aus dem GeoPackage als
+    Layer, der bewusst NICHT ins Projekt geladen wird (der Nutzer soll ihn
+    nicht selbst reinziehen muessen und auch nicht im Layerbaum haben).
+    None, falls die Datei/Tabelle nicht lesbar ist."""
+    layer = QgsVectorLayer(f"{pfad}|layername={WERTKLASSEN_TABELLE}", "wertklassen", "ogr")
+    return layer if layer.isValid() else None
+
+
+def _beschaffe_wertklassen_layer(iface, vergleich):
+    """Ermittelt den Wertklassenflaechen-Layer: 1. schon im Projekt geladen,
+    2. AB-Wertklassenflaechen.gpkg im Ordner des NAS-GeoPackages des
+    Vergleichs, 3. Nachfrage beim Nutzer. Rueckgabe None = abgebrochen/nicht
+    verfuegbar (Meldung wurde bereits gezeigt)."""
+    layer = _finde_wertklassen_layer()
+    if layer is not None:
+        return layer
+
+    nas_gpkg = vergleich.get("gpkg_pfad")
+    kandidat = None
+    if nas_gpkg:
+        kandidat = os.path.join(os.path.dirname(nas_gpkg), WERTKLASSEN_DATEINAME)
+        if os.path.exists(kandidat):
+            layer = _oeffne_wertklassen_gpkg(kandidat)
+            if layer is not None:
+                return layer
+            QMessageBox.warning(
+                iface.mainWindow(), "Wertklassenflächen nicht lesbar",
+                f"Die Datei\n{kandidat}\nwurde gefunden, enthält aber keine lesbare "
+                f"Tabelle '{WERTKLASSEN_TABELLE}'."
+            )
+            return None
+
+    ort = os.path.dirname(kandidat) if kandidat else "dem Ordner des NAS-GeoPackages"
+    antwort = QMessageBox.question(
+        iface.mainWindow(), "Wertklassenflächen nicht gefunden",
+        f"Im Ordner\n{ort}\nliegt keine Datei '{WERTKLASSEN_DATEINAME}'.\n\n"
+        "Bitte die Wertklassenflächen zuvor mit dem lefistogeopackage-Plugin "
+        "erzeugen und dort ablegen.\n\nJetzt manuell eine Datei auswählen?"
+    )
+    if antwort != QMessageBox.Yes:
+        return None
+    pfad, _ = QFileDialog.getOpenFileName(
+        iface.mainWindow(), "Wertklassenflächen-GeoPackage wählen",
+        os.path.dirname(kandidat) if kandidat else "", "GeoPackage (*.gpkg)"
+    )
+    if not pfad:
+        return None
+    layer = _oeffne_wertklassen_gpkg(pfad)
+    if layer is None:
+        QMessageBox.warning(
+            iface.mainWindow(), "Wertklassenflächen nicht lesbar",
+            f"Die gewählte Datei enthält keine lesbare Tabelle '{WERTKLASSEN_TABELLE}'."
+        )
+    return layer
+
+
 def oeffne_wertklassen_dialog(iface, plugin):
     """Prueft beide Voraussetzungen und oeffnet bei Erfolg das
     Ergebnis-Fenster - sonst eine erklaerende Meldung, was fehlt."""
-    if not _diff_layer_gueltig(plugin):
+    # Der Vergleich je Objektart wird im Plugin getrennt gehalten - es zaehlt
+    # der letzte AX_Flurstueck-Vergleich, egal ob danach andere Objektarten
+    # verglichen wurden.
+    vergleich = plugin.vergleiche.get("AX_Flurstueck")
+    if not _diff_layer_gueltig(vergleich):
         QMessageBox.information(
             iface.mainWindow(), "Kein Flurstücksvergleich vorhanden",
             "Es liegt kein aktueller Vergleich für AX_Flurstueck vor.\n\n"
-            "Bitte zuerst über 'Historie vergleichen...' einen Vergleich "
+            "Bitte zuerst über den Reiter 'Vergleich' einen Vergleich "
             "für die Objektart AX_Flurstueck durchführen."
         )
         return
-    if plugin.letzter_vergleich["objektart"] != "AX_Flurstueck":
-        QMessageBox.information(
-            iface.mainWindow(), "Falsche Objektart",
-            f"Der letzte Vergleich wurde für '{plugin.letzter_vergleich['objektart']}' "
-            "durchgeführt, nicht für AX_Flurstueck.\n\n"
-            "Die Wertklassenflächen-Ermittlung ist nur für einen "
-            "AX_Flurstueck-Vergleich sinnvoll. Bitte zuerst einen "
-            "entsprechenden Vergleich durchführen."
-        )
-        return
 
-    wertklassen_layer = _finde_wertklassen_layer()
+    wertklassen_layer = _beschaffe_wertklassen_layer(iface, vergleich)
     if wertklassen_layer is None:
-        QMessageBox.information(
-            iface.mainWindow(), "Wertklassenflächen nicht geladen",
-            f"Es ist kein Layer mit den Wertklassenflächen (Tabelle "
-            f"'{WERTKLASSEN_TABELLE}') im Projekt geladen.\n\n"
-            "Bitte zuerst die Wertklassenflächen laden (z.B. über das "
-            "lefistogeopackage-Plugin) und dann erneut versuchen."
-        )
         return
 
     ergebnisse = _ermittle_betroffene_wertklassen(
-        plugin.letzter_vergleich["diff_layer"],
-        plugin.letzter_vergleich.get("zustand_a_layer"),
-        plugin.letzter_vergleich.get("zustand_b_layer"),
-        plugin.letzter_vergleich["crs"],
+        vergleich["diff_layer"],
+        vergleich.get("zustand_a_layer"),
+        vergleich.get("zustand_b_layer"),
+        vergleich["crs"],
         wertklassen_layer,
     )
     if not ergebnisse:
@@ -125,7 +173,7 @@ def oeffne_wertklassen_dialog(iface, plugin):
         )
         return
 
-    dlg = WertklassenDialog(iface, ergebnisse, plugin.letzter_vergleich["crs"])
+    dlg = WertklassenDialog(iface, ergebnisse, vergleich["crs"])
     dlg.show()
     return dlg
 

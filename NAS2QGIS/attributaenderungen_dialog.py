@@ -8,6 +8,7 @@ in der Liste).
 
 import csv
 
+from qgis.PyQt import sip
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
     QApplication,
@@ -33,12 +34,20 @@ class AttributaenderungenDialog(QDialog):
     CRS des Quell-Layers aus dem GeoPackage) - fuer Zoom/Aufleuchten wird bei
     Bedarf ins aktuelle Projekt-CRS umgerechnet."""
 
-    def __init__(self, iface, aenderungen, crs, blink_controller, parent=None):
+    def __init__(self, iface, aenderungen, crs, blink_controller, blink_paar,
+                 objektart, zeitraum, parent=None):
+        """blink_paar: (Zustand-A-Layer, Zustand-B-Layer) des Vergleichs, zu dem
+        dieses Fenster gehoert - der Blinkvergleich laeuft immer auf genau
+        diesem Paar. zeitraum: (iso_a, iso_b)."""
         super().__init__(parent)
         self.iface = iface
         self._crs = crs
         self.blink_controller = blink_controller
-        self.setWindowTitle(f"Attributänderungen ({len(aenderungen)} Objekt(e))")
+        self._blink_paar = blink_paar
+        self.setWindowTitle(
+            f"Attributänderungen – {objektart} ({zeitraum[0][:10]} → {zeitraum[1][:10]}), "
+            f"{len(aenderungen)} Objekt(e)"
+        )
         self.setMinimumSize(720, 560)
 
         layout = QVBoxLayout(self)
@@ -60,6 +69,11 @@ class AttributaenderungenDialog(QDialog):
             for feldname, alt, neu in eintrag["felder"]:
                 top.addChild(QTreeWidgetItem([feldname, alt, neu]))
             self.baum.addTopLevelItem(top)
+
+        if not aenderungen:
+            hinweis = QTreeWidgetItem(["Keine Attributänderungen zwischen den gewählten Zeitpunkten.", "", ""])
+            hinweis.setFlags(Qt.NoItemFlags)
+            self.baum.addTopLevelItem(hinweis)
 
         self.baum.expandAll()
         for spalte in range(3):
@@ -191,25 +205,48 @@ class AttributaenderungenDialog(QDialog):
     # -- Blinkvergleich: delegiert an den BlinkController der Plugin-Instanz,
     # damit er auch nach dem Schliessen dieses Fensters weiterlaeuft ---------
 
+    def _paar_gueltig(self):
+        a, b = self._blink_paar
+        for layer in (a, b):
+            if layer is None or sip.isdeleted(layer):
+                return False
+            if QgsProject.instance().mapLayer(layer.id()) is None:
+                return False
+        return True
+
+    def _ist_aktives_paar(self):
+        """True nur, wenn der Blinkvergleich gerade auf DEM Layerpaar dieses
+        Fensters laeuft (nicht auf dem einer anderen Objektart)."""
+        if not self.blink_controller.ist_aktiv() or not self._paar_gueltig():
+            return False
+        a, b = self._blink_paar
+        return self.blink_controller.paar_ids() == (a.id(), b.id())
+
     def _blinkvergleich_ui_aktualisieren(self):
-        self.blinkvergleich_button.setEnabled(self.blink_controller.hat_gueltige_layer())
-        if self.blink_controller.ist_aktiv():
+        self.blinkvergleich_button.setEnabled(self._paar_gueltig())
+        if self._ist_aktives_paar():
             self.blinkvergleich_button.setText("Blinkvergleich stoppen")
         else:
             self.blinkvergleich_button.setText("Blinkvergleich starten")
 
     def _blinkvergleich_starten_stoppen(self):
-        if self.blink_controller.ist_aktiv():
+        if self._ist_aktives_paar():
             self.blink_controller.stoppen()
         else:
-            if not self.blink_controller.hat_gueltige_layer():
+            if not self._paar_gueltig():
                 QMessageBox.warning(
                     self, "Fehler",
-                    "Keine Vergleichs-Layer vorhanden. Bitte zuerst einen Vergleich ausführen."
+                    "Die Vergleichs-Layer sind nicht mehr vorhanden. Bitte den Vergleich erneut ausführen."
                 )
                 return
+            a, b = self._blink_paar
+            if self.blink_controller.paar_ids() != (a.id(), b.id()):
+                # Der Controller haelt noch das Paar einer anderen Objektart
+                # (oder keins) - auf das Paar dieses Fensters umstellen.
+                self.blink_controller.layer_setzen(a, b)
             self.blink_controller.starten(self.blinkvergleich_intervall.value())
         self._blinkvergleich_ui_aktualisieren()
 
     def _blinkvergleich_intervall_geaendert(self, wert):
-        self.blink_controller.intervall_setzen(wert)
+        if self._ist_aktives_paar():
+            self.blink_controller.intervall_setzen(wert)
