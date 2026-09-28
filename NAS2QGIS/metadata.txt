@@ -1,0 +1,14 @@
+[general]
+name=NAS2QGIS
+qgisMinimumVersion=3.16
+description=Import von NAS/ALKIS-Lieferungen in ein historisiertes GeoPackage und Vergleich zweier Zeitpunkte
+version=0.6.2
+author=NAS-Anonymisierer-Team
+email=beispiel@beispiel.de
+about=Importiert NAS-XML-Lieferungen (Erst- und Differenzabgaben) chronologisch in ein historisiertes GeoPackage (gueltig_von/gueltig_bis je Objektversion) und ermoeglicht den visuellen Vergleich zweier Lieferzeitpunkte inkl. Differenzflaeche und Attributaenderungen.
+tracker=
+repository=
+category=Vector
+tags=alkis,nas,kataster,geopackage
+experimental=False
+deprecated=False
