@@ -7,6 +7,7 @@ Versionierung nach [Semantic Versioning](https://semver.org/lang/de/).
 
 ---
 ## [unrelesead]
+## [1.0.1] 2026-09-29
 ### Added
 - Prüfungen zum Einspielen der NBA Daten ergänzt:
 - geprüft wird auf richtige Verfahrenszugehörigkeit
