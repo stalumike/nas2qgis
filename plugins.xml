@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <plugins>
-  <pyqgis_plugin name="NAS2QGIS" version="1.0.0">
+  <pyqgis_plugin name="NAS2QGIS" version="1.0.1">
     <description>Import von NAS/ALKIS-Lieferungen in ein historisiertes GeoPackage und Vergleich zweier Zeitpunkte</description>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
     <qgis_minimum_version>3.16</qgis_minimum_version>
     <file_name>nas2qgis.zip</file_name>
     <author_name>STALUMS Abt. 3</author_name>

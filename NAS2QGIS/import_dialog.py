@@ -20,7 +20,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import QgsVectorLayer, QgsProject
 
 from .parser import parse_delivery_metadata, verfahrensnummer_aus_auftragsnummer
-from .writer import import_delivery, finalize_geopackage
+from .writer import import_delivery, finalize_geopackage, pruefe_chronologische_reihenfolge, pruefe_verfahren, pruefe_bereits_importiert
 from .styling import style_layer
 from .beteiligung import berechne_beteiligtenstatus
 
@@ -29,6 +29,7 @@ from .beteiligung import berechne_beteiligtenstatus
 # (z.B. AX_Flurstueck, AX_Gebaeude, AX_Grenzpunkt, ...).
 STANDARD_LAYER_AUSWAHL = {
     "AX_Flurstueck",
+    "AX_Gebaeude",
 }
 
 
@@ -269,9 +270,53 @@ class ImportTab(QWidget):
         mit_datum.sort(key=lambda t: t[0])
 
         self.start_button.setEnabled(False)
+        uebersprungene_dateien = []
         try:
             for ende, pfad in mit_datum:
                 self._log(f"\n=== {os.path.basename(pfad)} (abgabeintervallEnde={ende}) ===")
+                try:
+                    meta_vorab = parse_delivery_metadata(pfad)
+                except Exception as exc:
+                    self._log(f"FEHLER beim Lesen von {os.path.basename(pfad)}: {exc}")
+                    return
+                dateiname = os.path.basename(pfad)
+
+                warnung_dup = pruefe_bereits_importiert(self.gpkg_pfad, meta_vorab, dateiname)
+                if warnung_dup:
+                    antwort = QMessageBox.warning(
+                        self, "Bereits eingespielt?",
+                        warnung_dup + "\n\nTrotzdem einspielen?",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                    )
+                    if antwort != QMessageBox.Yes:
+                        self._log("  Übersprungen (bereits eingespielt, Nutzer hat abgelehnt).")
+                        uebersprungene_dateien.append(dateiname)
+                        continue
+
+                warnung = pruefe_chronologische_reihenfolge(self.gpkg_pfad, meta_vorab)
+                if warnung:
+                    antwort = QMessageBox.warning(
+                        self, "Lieferung nicht chronologisch",
+                        warnung + "\n\nTrotzdem einspielen? (Nicht empfohlen - "
+                        "kann die Historisierung verfälschen.)",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                    )
+                    if antwort != QMessageBox.Yes:
+                        self._log("  Übersprungen (Reihenfolge-Warnung, Nutzer hat abgelehnt).")
+                        uebersprungene_dateien.append(dateiname)
+                        continue
+
+                warnung_verfahren = pruefe_verfahren(self.gpkg_pfad, meta_vorab)
+                if warnung_verfahren:
+                    antwort = QMessageBox.warning(
+                        self, "Anderes Verfahren?",
+                        warnung_verfahren + "\n\nTrotzdem einspielen?",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                    )
+                    if antwort != QMessageBox.Yes:
+                        self._log("  Übersprungen (anderes Verfahren, Nutzer hat abgelehnt).")
+                        uebersprungene_dateien.append(dateiname)
+                        continue
                 try:
                     counts, meta = import_delivery(self.gpkg_pfad, pfad)
                 except Exception as exc:
@@ -288,7 +333,14 @@ class ImportTab(QWidget):
 
             self._log("Fertig.")
             self._bereits_eingelesen_aktualisieren()
-            QMessageBox.information(self, "Import abgeschlossen", "Alle Dateien wurden eingespielt.")
+            if uebersprungene_dateien:
+                QMessageBox.warning(
+                    self, "Import mit Übersprüngen abgeschlossen",
+                    f"{len(uebersprungene_dateien)} von {len(mit_datum)} Datei(en) wurden NICHT "
+                    f"eingespielt (Warnung abgelehnt):\n\n" + "\n".join(uebersprungene_dateien)
+                )
+            else:
+                QMessageBox.information(self, "Import abgeschlossen", "Alle Dateien wurden eingespielt.")
         finally:
             self.start_button.setEnabled(True)
 

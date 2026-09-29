@@ -12,15 +12,16 @@ GeoPackage wird direkt ueber sqlite3 + manuell gebautem WKB/GPKG-Binaerformat
 geschrieben, damit das Skript ohne GDAL/Fiona/PyQGIS lauffaehig ist.
 """
 
+import os
 import re
 import sqlite3
 import struct
 from datetime import datetime, timezone
 
 try:
-    from .parser import parse_nas_file, parse_delivery_metadata
+    from .parser import parse_nas_file, parse_delivery_metadata, verfahrensnummer_aus_auftragsnummer
 except ImportError:
-    from parser import parse_nas_file, parse_delivery_metadata
+    from parser import parse_nas_file, parse_delivery_metadata, verfahrensnummer_aus_auftragsnummer
 
 WKB_TYPE = {"POINT": 1, "POLYGON": 3, "MULTIPOLYGON": 6}
 
@@ -458,6 +459,121 @@ CRS_URN_TO_EPSG = {
 }
 
 
+def pruefe_bereits_importiert(gpkg_path, meta, dateiname):
+    """Prueft, ob eine Lieferung mit DEMSELBEN Dateinamen oder demselben
+    abgabeintervallEnde bereits in dieses GeoPackage eingespielt wurde -
+    unabhaengig davon, ob es die zuletzt eingespielte Lieferung ist oder
+    eine aeltere. Das faengt genau den Fall ab, dass eine Lieferung ein
+    zweites Mal eingespielt wird (z.B. weil sie noch von einem frueheren
+    Importlauf in der Dateiliste stehen geblieben war) - erneutes Einspielen
+    wuerde ihre Insert/Replace/Delete-Saetze ein zweites Mal auf einen
+    Bestand anwenden, der sie schon enthaelt, und die Historisierung
+    verfaelschen. Gibt einen Warntext zurueck, falls ja - sonst None."""
+    if not os.path.exists(gpkg_path):
+        return None
+    conn = sqlite3.connect(gpkg_path)
+    try:
+        rows = conn.execute(
+            "SELECT dateiname, abgabeintervallEnde, importiert_am FROM nas_lieferungen "
+            "WHERE dateiname = ? OR abgabeintervallEnde = ?",
+            (dateiname, meta.get("abgabeintervallEnde")),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    if not rows:
+        return None
+    alter_dateiname, alte_abgabe_ende, importiert_am = rows[0]
+    return (
+        f"Eine Lieferung mit demselben Dateinamen oder demselben Lieferdatum wurde "
+        f"bereits am {importiert_am} eingespielt "
+        f"('{alter_dateiname}', abgabeintervallEnde={alte_abgabe_ende}).\n"
+        f"Erneutes Einspielen wendet dieselben Änderungen ein zweites Mal an und "
+        f"verfälscht die Historisierung."
+    )
+
+
+def pruefe_chronologische_reihenfolge(gpkg_path, meta):
+    """Prueft, ob die neue Lieferung AELTER ist als die zuletzt in dieses
+    GeoPackage eingespielte (aus nas_lieferungen). Gibt einen Warntext
+    zurueck, falls ja - sonst None. Faengt genau den Fall ab, dass zwei
+    Lieferungen in getrennten Importlaeufen (nicht gemeinsam ausgewaehlt und
+    damit nicht automatisch sortiert) in falscher Reihenfolge eingespielt
+    werden - das wuerde die Historisierung verfaelschen (die offene Zeile
+    wird immer chronologisch "vorwaerts" geschlossen, nicht rueckwirkend
+    eingefuegt)."""
+    neu = meta.get("abgabeintervallEnde")
+    if neu is None or not os.path.exists(gpkg_path):
+        return None
+    conn = sqlite3.connect(gpkg_path)
+    try:
+        row = conn.execute(
+            "SELECT dateiname, abgabeintervallEnde FROM nas_lieferungen "
+            "ORDER BY abgabeintervallEnde DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    letzter_dateiname, letztes_datum = row
+    if neu < letztes_datum:
+        return (
+            f"Diese Lieferung (abgabeintervallEnde={neu}) ist ÄLTER als die zuletzt "
+            f"eingespielte '{letzter_dateiname}' (abgabeintervallEnde={letztes_datum}).\n"
+            f"Werden Lieferungen nicht in chronologischer Reihenfolge eingespielt, "
+            f"wird die Historisierung verfälscht."
+        )
+    return None
+
+
+def pruefe_verfahren(gpkg_path, meta):
+    """Prueft, ob die neue Lieferung zu einem ANDEREN Verfahren gehoert als
+    die bereits im GeoPackage vorhandenen (Verfahrensnummer aus
+    auftragsnummer, Rueckfall antragsnummer - siehe
+    verfahrensnummer_aus_auftragsnummer()). Gibt einen Warntext zurueck,
+    falls ja - sonst None.
+
+    Bewusst nur eine Warnung, kein harter Block: Nicht jedes Katasteramt
+    liefert auftragsnummer im erwarteten Muster, die Erkennung ist also ein
+    Best-Effort-Hinweis fuers Vier-Augen-Prinzip, keine Garantie. Kann eine
+    Verfahrensnummer weder fuer die neue noch fuer die vorhandenen
+    Lieferungen ermittelt werden, wird stillschweigend nicht gewarnt (lieber
+    keine Warnung als eine falsche)."""
+    neu = (
+        verfahrensnummer_aus_auftragsnummer(meta.get("auftragsnummer"))
+        or verfahrensnummer_aus_auftragsnummer(meta.get("antragsnummer"))
+    )
+    if neu is None or not os.path.exists(gpkg_path):
+        return None
+
+    conn = sqlite3.connect(gpkg_path)
+    try:
+        rows = conn.execute("SELECT antragsnummer, auftragsnummer FROM nas_lieferungen").fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    if not rows:
+        return None
+
+    vorhandene = set()
+    for antragsnummer, auftragsnummer in rows:
+        v = verfahrensnummer_aus_auftragsnummer(auftragsnummer) or verfahrensnummer_aus_auftragsnummer(antragsnummer)
+        if v:
+            vorhandene.add(v)
+    if not vorhandene or neu in vorhandene:
+        return None
+
+    return (
+        f"Diese Lieferung gehört zu Verfahren '{neu}'. Im GeoPackage sind bisher nur "
+        f"Lieferungen aus Verfahren {', '.join(sorted(vorhandene))} enthalten.\n"
+        f"Das könnte eine versehentlich falsche Datei sein."
+    )
+
+
 def import_delivery(gpkg_path, nas_path, srs_id=None):
     """Spielt eine einzelne NAS-Datei (Erst- oder Differenzabgabe) historisiert
     in ein (ggf. neues) GeoPackage ein. Dateien MUESSEN chronologisch
@@ -492,7 +608,6 @@ def import_delivery(gpkg_path, nas_path, srs_id=None):
             writer.apply_delete(feature, meta.get("abgabeintervallEnde"))
         counts[feature.action] += 1
 
-    import os
     writer.conn.execute(
         "INSERT INTO nas_lieferungen (dateiname, antragsnummer, auftragsnummer, abgabeintervallBeginn, abgabeintervallEnde) "
         "VALUES (?, ?, ?, ?, ?)",
