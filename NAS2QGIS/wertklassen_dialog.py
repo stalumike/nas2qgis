@@ -1,52 +1,71 @@
 """
-Verschneidet den Differenzlayer eines AX_Flurstueck-Vergleichs mit den
-Wertklassenflaechen (aus dem separaten lefistogeopackage-Plugin) und listet
-gruppiert je geaendertem Flurstueck auf, welche Wertklassenflaechen davon
-beruehrt werden - das ist die fuer die Homogenisierung relevante Richtung
-("welche Wertklassenflaechen muss ich mir fuer dieses Flurstueck anschauen"),
-nicht umgekehrt.
+Abschnittsvergleich Flurstueck x Wertklassenflaeche zwischen zwei Staenden.
 
-Voraussetzungen, die vor dem Ausfuehren geprueft werden:
-  1. Es liegt ein Vergleichsergebnis fuer AX_Flurstueck vor (Differenzlayer
-     der Plugin-Instanz, siehe vergleich_dialog.py -> plugin.vergleiche).
-  2. Das GeoPackage mit den Wertklassenflaechen (AB-Wertklassenflaechen.gpkg,
-     vom Nutzer ueber das lefistogeopackage-Plugin erzeugt - diese Logik wird
-     hier bewusst NICHT nachgebaut) wird automatisch im selben Ordner wie das
-     NAS-GeoPackage des Vergleichs gesucht und intern geoeffnet, ohne den Layer
-     ins Projekt zu laden. Ist bereits ein passender Layer im Projekt
-     geladen, wird dieser bevorzugt. Nur wenn nichts gefunden wird, fragt
-     das Plugin nach dem Speicherort.
+Ablauf:
+  1. Aus der SCD2-Historie des NAS-GeoPackages werden AX_Flurstueck-Zustand A
+     und Zustand B gelesen (Vorauswahl: vorletzte und letzte Lieferung, im
+     Dialog frei aenderbar). Ein vorheriger Vergleich im Reiter 'Vergleich'
+     ist NICHT noetig.
+  2. Vorfilter: Nur Flurstuecke, die neu sind, entfallen sind oder deren
+     Geometrie sich geaendert hat, werden verschnitten. Da die
+     Wertklassenflaechen in beiden Zustaenden identisch sind, koennen sich
+     Abschnitte nur dort unterscheiden - das Ergebnis ist also dasselbe wie
+     bei einer Vollverschneidung, nur um Groessenordnungen schneller.
+  3. Fuer diese Flurstuecke werden in A und in B Abschnitte gebildet
+     (Flurstueck x Wertklassenflaeche) und ueber das Schluesselpaar
+     (Flurstuecks-OID, Wertklassenflaeche) verglichen.
+  4. Die ROHDATEN (alle Paare mit Flaeche A / Flaeche B) werden auf der
+     Plugin-Instanz gehalten. Die vom Nutzer einstellbaren Filter
+     (Mindest-Flaechendifferenz, Mindestgroesse) wirken NUR in der
+     Klassifizierung - eine Filteraenderung braucht keine neue Verschneidung.
 
-Nur Differenzobjekte, die tatsaechlich eine geometrische Aenderung darstellen
-(neu, entfernt, geometrisch geaendert) werden verschnitten - reine
-Attributaenderungen ohne Geometrieaenderung sind fuer die Wertermittlung
-irrelevant.
+Die Wertklassenflaechen (AB-Wertklassenflaechen.gpkg) werden vom Nutzer ueber
+das lefistogeopackage-Plugin erzeugt - diese Logik wird hier bewusst NICHT
+nachgebaut. Gesucht wird: 1. bereits im Projekt geladen, 2. im Ordner des
+NAS-GeoPackages, 3. Nachfrage beim Nutzer.
 """
 
 import csv
 import os
 
 from qgis.PyQt import sip
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QTimer, QVariant
+from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
+    QLabel,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
 )
 from qgis.core import (
+    QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeature,
+    QgsFeatureRequest,
+    QgsField,
+    QgsFields,
     QgsGeometry,
     QgsProject,
+    QgsSettings,
     QgsSpatialIndex,
     QgsVectorLayer,
+    QgsWkbTypes,
 )
+
+from .styling import ABSCHNITT_KATEGORIEN, style_abschnitt_layer
+from .vergleich_dialog import _datum_de, _gpkg_path_from_layer, _lieferungen_lesen, _zustand_ausdruck
 
 WERTKLASSEN_TABELLE = "AB-Wertklassenflaechen"
 WERTKLASSEN_DATEINAME = "AB-Wertklassenflaechen.gpkg"
@@ -54,69 +73,76 @@ WERTKLASSEN_OID_FELD = "uuid"
 WERTKLASSEN_WEKL_FELD = "wekl"
 WERTKLASSEN_NUNK_FELD = "nunk"
 
-# Vergleichsstatus, die eine echte geometrische Aenderung darstellen und
-# daher fuer die Wertermittlung relevant sind - reine Attributaenderungen
-# (keine Geometrieaenderung) werden nicht verschnitten.
-GEOMETRISCH_RELEVANTE_STATI = {"neu", "entfernt", "geometrie_geaendert", "geometrie_und_attribute_geaendert"}
+FLURSTUECK_TABELLE = "AX_Flurstueck"
+# Erstes vorhandene Feld wird als Flurstueckskennzeichen angezeigt (nur Anzeige,
+# der Abgleich laeuft immer ueber die OID). Fehlt es, bleibt die Anzeige leer.
+FLURSTUECK_KENNZEICHEN_FELDER = ("flurstueckskennzeichen",)
+
+# Technische Untergrenze gegen reines Rundungsrauschen der Verschneidung
+# (1 cm^2). Bewusst fest und winzig - alle fachlichen Schwellen sind
+# Nutzerfilter und wirken erst in der Klassifizierung.
+TECHNISCHE_MIN_FLAECHE = 0.0001
+
+SETTINGS_MIN_DELTA = "NAS2QGIS/wertklassen_min_delta"
+SETTINGS_MIN_FLAECHE = "NAS2QGIS/wertklassen_min_flaeche"
+SETTINGS_SPLITTER = "NAS2QGIS/wertklassen_splitter_zeigen"
+STANDARD_MIN_DELTA = 1.0
+STANDARD_MIN_FLAECHE = 1.0
+
+STATUS_TEXT = {wert: text for wert, text, _, _ in ABSCHNITT_KATEGORIEN}
+STATUS_FARBE = {wert: kontur for wert, _, kontur, _ in ABSCHNITT_KATEGORIEN}
 
 
-def _diff_layer_gueltig(vergleich):
-    if vergleich is None:
+# --------------------------------------------------------------------------
+# Datenquellen finden
+# --------------------------------------------------------------------------
+
+def _ist_flurstueck_quelle(layer):
+    if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
         return False
-    diff_layer = vergleich.get("diff_layer")
-    if diff_layer is None or sip.isdeleted(diff_layer):
+    if layer.providerType() != "ogr" or layer.fields().indexOf("gueltig_von") < 0:
         return False
-    return QgsProject.instance().mapLayer(diff_layer.id()) is not None
+    teile = layer.source().split("|")
+    return f"layername={FLURSTUECK_TABELLE}" in teile or layer.name() == FLURSTUECK_TABELLE
 
 
 def _finde_wertklassen_layer():
-    """Sucht einen geladenen Layer, dessen GeoPackage-Quelltabelle
-    WERTKLASSEN_TABELLE heisst - unabhaengig davon, wie der Layer im
-    Projekt umbenannt wurde."""
+    """Geladener Layer, dessen Quelltabelle WERTKLASSEN_TABELLE heisst -
+    unabhaengig davon, wie er im Projekt umbenannt wurde."""
     for layer in QgsProject.instance().mapLayers().values():
-        if not isinstance(layer, QgsVectorLayer):
-            continue
-        if f"layername={WERTKLASSEN_TABELLE}" in layer.source():
+        if isinstance(layer, QgsVectorLayer) and f"layername={WERTKLASSEN_TABELLE}" in layer.source():
             return layer
     return None
 
 
 def _oeffne_wertklassen_gpkg(pfad):
-    """Oeffnet die Wertklassenflaechen-Tabelle aus dem GeoPackage als
-    Layer, der bewusst NICHT ins Projekt geladen wird (der Nutzer soll ihn
-    nicht selbst reinziehen muessen und auch nicht im Layerbaum haben).
-    None, falls die Datei/Tabelle nicht lesbar ist."""
+    """Oeffnet die Wertklassenflaechen intern (NICHT ins Projekt geladen)."""
     layer = QgsVectorLayer(f"{pfad}|layername={WERTKLASSEN_TABELLE}", "wertklassen", "ogr")
     return layer if layer.isValid() else None
 
 
-def _beschaffe_wertklassen_layer(iface, vergleich):
-    """Ermittelt den Wertklassenflaechen-Layer: 1. schon im Projekt geladen,
-    2. AB-Wertklassenflaechen.gpkg im Ordner des NAS-GeoPackages des
-    Vergleichs, 3. Nachfrage beim Nutzer. Rueckgabe None = abgebrochen/nicht
-    verfuegbar (Meldung wurde bereits gezeigt)."""
+def _beschaffe_wertklassen_layer(parent, nas_gpkg):
+    """1. schon im Projekt, 2. neben dem NAS-GeoPackage, 3. Nachfrage.
+    None = abgebrochen/nicht verfuegbar (Meldung wurde bereits gezeigt)."""
     layer = _finde_wertklassen_layer()
     if layer is not None:
         return layer
 
-    nas_gpkg = vergleich.get("gpkg_pfad")
-    kandidat = None
-    if nas_gpkg:
-        kandidat = os.path.join(os.path.dirname(nas_gpkg), WERTKLASSEN_DATEINAME)
-        if os.path.exists(kandidat):
-            layer = _oeffne_wertklassen_gpkg(kandidat)
-            if layer is not None:
-                return layer
-            QMessageBox.warning(
-                iface.mainWindow(), "Wertklassenflächen nicht lesbar",
-                f"Die Datei\n{kandidat}\nwurde gefunden, enthält aber keine lesbare "
-                f"Tabelle '{WERTKLASSEN_TABELLE}'."
-            )
-            return None
+    kandidat = os.path.join(os.path.dirname(nas_gpkg), WERTKLASSEN_DATEINAME) if nas_gpkg else None
+    if kandidat and os.path.exists(kandidat):
+        layer = _oeffne_wertklassen_gpkg(kandidat)
+        if layer is not None:
+            return layer
+        QMessageBox.warning(
+            parent, "Wertklassenflächen nicht lesbar",
+            f"Die Datei\n{kandidat}\nwurde gefunden, enthält aber keine lesbare "
+            f"Tabelle '{WERTKLASSEN_TABELLE}'."
+        )
+        return None
 
     ort = os.path.dirname(kandidat) if kandidat else "dem Ordner des NAS-GeoPackages"
     antwort = QMessageBox.question(
-        iface.mainWindow(), "Wertklassenflächen nicht gefunden",
+        parent, "Wertklassenflächen nicht gefunden",
         f"Im Ordner\n{ort}\nliegt keine Datei '{WERTKLASSEN_DATEINAME}'.\n\n"
         "Bitte die Wertklassenflächen zuvor mit dem lefistogeopackage-Plugin "
         "erzeugen und dort ablegen.\n\nJetzt manuell eine Datei auswählen?"
@@ -124,7 +150,7 @@ def _beschaffe_wertklassen_layer(iface, vergleich):
     if antwort != QMessageBox.Yes:
         return None
     pfad, _ = QFileDialog.getOpenFileName(
-        iface.mainWindow(), "Wertklassenflächen-GeoPackage wählen",
+        parent, "Wertklassenflächen-GeoPackage wählen",
         os.path.dirname(kandidat) if kandidat else "", "GeoPackage (*.gpkg)"
     )
     if not pfad:
@@ -132,57 +158,15 @@ def _beschaffe_wertklassen_layer(iface, vergleich):
     layer = _oeffne_wertklassen_gpkg(pfad)
     if layer is None:
         QMessageBox.warning(
-            iface.mainWindow(), "Wertklassenflächen nicht lesbar",
+            parent, "Wertklassenflächen nicht lesbar",
             f"Die gewählte Datei enthält keine lesbare Tabelle '{WERTKLASSEN_TABELLE}'."
         )
     return layer
 
 
-def oeffne_wertklassen_dialog(iface, plugin):
-    """Prueft beide Voraussetzungen und oeffnet bei Erfolg das
-    Ergebnis-Fenster - sonst eine erklaerende Meldung, was fehlt."""
-    # Der Vergleich je Objektart wird im Plugin getrennt gehalten - es zaehlt
-    # der letzte AX_Flurstueck-Vergleich, egal ob danach andere Objektarten
-    # verglichen wurden.
-    vergleich = plugin.vergleiche.get("AX_Flurstueck")
-    if not _diff_layer_gueltig(vergleich):
-        QMessageBox.information(
-            iface.mainWindow(), "Kein Flurstücksvergleich vorhanden",
-            "Es liegt kein aktueller Vergleich für AX_Flurstueck vor.\n\n"
-            "Bitte zuerst über den Reiter 'Vergleich' einen Vergleich "
-            "für die Objektart AX_Flurstueck durchführen."
-        )
-        return
-
-    wertklassen_layer = _beschaffe_wertklassen_layer(iface, vergleich)
-    if wertklassen_layer is None:
-        return
-
-    ergebnisse = _ermittle_betroffene_wertklassen(
-        vergleich["diff_layer"],
-        vergleich.get("zustand_a_layer"),
-        vergleich.get("zustand_b_layer"),
-        vergleich["crs"],
-        wertklassen_layer,
-    )
-    if not ergebnisse:
-        QMessageBox.information(
-            iface.mainWindow(), "Keine betroffenen Wertklassenflächen",
-            "Keine Wertklassenfläche überschneidet sich mit einer geometrischen "
-            "Änderung aus dem letzten Flurstücksvergleich."
-        )
-        return
-
-    # Elternfenster = QGIS-Hauptfenster (wie beim Attributaenderungen-Fenster):
-    # ohne Elternfenster faellt das Fenster hinter die Karte, sobald der
-    # Hauptdialog geschlossen wird, und wird nicht sicher von Qt verwaltet.
-    dlg = WertklassenDialog(iface, ergebnisse, vergleich["crs"], iface.mainWindow())
-    dlg.setAttribute(Qt.WA_DeleteOnClose)
-    dlg.show()
-    dlg.raise_()
-    dlg.activateWindow()
-    return dlg
-
+# --------------------------------------------------------------------------
+# Rechenphase (einmalig, teuer)
+# --------------------------------------------------------------------------
 
 def _sichere_geom(geom):
     if geom is None or geom.isEmpty():
@@ -198,175 +182,556 @@ def _sichere_geom(geom):
     return bereinigt
 
 
-def _ermittle_betroffene_wertklassen(diff_layer, zustand_a_layer, zustand_b_layer, diff_crs, wertklassen_layer):
-    """Liefert je geaendertem Flurstueck die davon beruehrten
-    Wertklassenflaechen. Rueckgabe: Liste von Dicts
-    {oid, geometrie (im diff_crs), wertklassenflaechen: [{uuid, wekl, geometrie}, ...]}.
+def _nur_flaechen(geom):
+    """Verschneidungen koennen GeometryCollections mit Linien/Punkten
+    (reine Beruehrungen) liefern - nur die Flaechenanteile behalten."""
+    if geom is None or geom.isEmpty():
+        return None
+    if geom.type() == QgsWkbTypes.PolygonGeometry:
+        return geom
+    teile = [g for g in geom.asGeometryCollection() if g.type() == QgsWkbTypes.PolygonGeometry]
+    if not teile:
+        return None
+    return QgsGeometry.collectGeometry(teile)
 
-    'geometrie' beim Flurstueck ist bewusst NICHT die (oft sehr duenne)
-    Differenzflaeche, sondern - falls auffindbar - die volle aktuelle
-    Flurstuecksflaeche (Zustand B, Rueckfall Zustand A) - fuers Zoomen/
-    Aufleuchten ist eine ganze Flaeche sichtbar sinnvoll, ein hauchduenner
-    Streifen praktisch nicht. Fuer die Verschneidung mit den
-    Wertklassenflaechen wird weiterhin die tatsaechliche Aenderungsflaeche
-    (aus dem Differenzlayer) verwendet - das ist fachlich der richtige
-    Massstab dafuer, welche Wertklassenflaechen tatsaechlich betroffen sind.
-    Alle Geometrien werden konsistent im diff_crs zurueckgegeben, damit der
-    Dialog nur mit einem einzigen CRS umgehen muss.
-    """
-    ziel_crs = wertklassen_layer.crs()
-    hin_transform = None
-    rueck_transform = None
-    if diff_crs.isValid() and diff_crs != ziel_crs:
-        hin_transform = QgsCoordinateTransform(diff_crs, ziel_crs, QgsProject.instance())
-        rueck_transform = QgsCoordinateTransform(ziel_crs, diff_crs, QgsProject.instance())
 
-    # Wertklassenflaechen einmalig einlesen + in einen Spatial Index packen,
-    # damit wir nicht fuer jedes geaenderte Flurstueck alle 2000+ Flaechen
-    # einzeln pruefen muessen.
-    oid_idx = wertklassen_layer.fields().indexOf(WERTKLASSEN_OID_FELD)
-    wekl_idx = wertklassen_layer.fields().indexOf(WERTKLASSEN_WEKL_FELD)
-    nunk_idx = wertklassen_layer.fields().indexOf(WERTKLASSEN_NUNK_FELD)
-    wk_geom_cache = {}
-    wk_attr_cache = {}
+def _wertklassen_einlesen(wk_layer, ziel_crs):
+    """Wertklassenflaechen einmalig einlesen, ins CRS der Flurstuecke
+    transformieren (dort wird auch die Flaeche gemessen) und indexieren."""
+    transform = None
+    if wk_layer.crs().isValid() and ziel_crs.isValid() and wk_layer.crs() != ziel_crs:
+        transform = QgsCoordinateTransform(wk_layer.crs(), ziel_crs, QgsProject.instance())
+
+    felder = wk_layer.fields()
+    oid_idx = felder.indexOf(WERTKLASSEN_OID_FELD)
+    wekl_idx = felder.indexOf(WERTKLASSEN_WEKL_FELD)
+    nunk_idx = felder.indexOf(WERTKLASSEN_NUNK_FELD)
+
+    geoms, attrs = {}, {}
     index = QgsSpatialIndex()
-    for wk_feat in wertklassen_layer.getFeatures():
-        geom = _sichere_geom(wk_feat.geometry())
+    for feat in wk_layer.getFeatures():
+        geom = feat.geometry()
+        if geom is None or geom.isEmpty():
+            continue
+        if transform is not None:
+            geom = QgsGeometry(geom)
+            geom.transform(transform)
+        geom = _sichere_geom(geom)
         if geom is None:
             continue
-        wk_geom_cache[wk_feat.id()] = geom
-        wk_attr_cache[wk_feat.id()] = {
-            "uuid": wk_feat[oid_idx] if oid_idx >= 0 else str(wk_feat.id()),
-            "wekl": wk_feat[wekl_idx] if wekl_idx >= 0 else None,
-            "nunk": wk_feat[nunk_idx] if nunk_idx >= 0 else None,
+        geoms[feat.id()] = geom
+        nunk = feat[nunk_idx] if nunk_idx >= 0 else None
+        wekl = feat[wekl_idx] if wekl_idx >= 0 else None
+        attrs[feat.id()] = {
+            "uuid": str(feat[oid_idx]) if oid_idx >= 0 else str(feat.id()),
+            "nutzung_wekl": " ".join(str(t) for t in (nunk, wekl) if t not in (None, "")),
         }
-        indexierbar = QgsFeature(wk_feat.id())
+        indexierbar = QgsFeature(feat.id())
         indexierbar.setGeometry(geom)
         index.addFeature(indexierbar)
+    return geoms, attrs, index
 
-    status_feld_idx = diff_layer.fields().indexOf("vergleichsstatus")
-    oid_feld_idx = diff_layer.fields().indexOf("oid")
 
-    # Volle Flurstuecksgeometrie je OID nachschlagbar machen (Zustand B
-    # bevorzugt = aktueller/neuer Stand, Zustand A als Rueckfall fuer
-    # entfernte Flurstuecke, die in B gar nicht mehr existieren).
-    volle_geom_je_oid = {}
-    for quell_layer in (zustand_a_layer, zustand_b_layer):
-        if quell_layer is None or sip.isdeleted(quell_layer):
+def _flurstuecke_lesen(layer, iso):
+    """{oid: (rohgeometrie, kennzeichen)} fuer den Zustand zum Zeitpunkt iso."""
+    kennz_feld = next((f for f in FLURSTUECK_KENNZEICHEN_FELDER if layer.fields().indexOf(f) >= 0), None)
+    ergebnis = {}
+    anfrage = QgsFeatureRequest().setFilterExpression(_zustand_ausdruck(iso))
+    for f in layer.getFeatures(anfrage):
+        kennz = f[kennz_feld] if kennz_feld else None
+        ergebnis[f["oid"]] = (f.geometry(), "" if kennz in (None, "") else str(kennz))
+    return ergebnis
+
+
+def _abschnitte_bilden(flst_geom, wk_geoms, index):
+    """{wk_fid: abschnitt_geom} fuer ein Flurstueck."""
+    abschnitte = {}
+    for wk_fid in index.intersects(flst_geom.boundingBox()):
+        wk_geom = wk_geoms.get(wk_fid)
+        if wk_geom is None or not wk_geom.intersects(flst_geom):
             continue
-        oid_idx_quelle = quell_layer.fields().indexOf("oid")
-        if oid_idx_quelle < 0:
+        try:
+            schnitt = _nur_flaechen(flst_geom.intersection(wk_geom))
+        except Exception:
             continue
-        for f in quell_layer.getFeatures():
-            geom = _sichere_geom(f.geometry())
-            if geom is not None:
-                volle_geom_je_oid[f["oid"]] = geom  # Zustand B ueberschreibt A, da spaeter in der Schleife
-
-    ergebnisse = []
-    for feat in diff_layer.getFeatures():
-        if status_feld_idx >= 0 and feat["vergleichsstatus"] not in GEOMETRISCH_RELEVANTE_STATI:
+        if schnitt is None or schnitt.area() < TECHNISCHE_MIN_FLAECHE:
             continue
-        original_geom = _sichere_geom(feat.geometry())
-        if original_geom is None:
+        abschnitte[wk_fid] = schnitt
+    return abschnitte
+
+
+def _berechne_abschnitte(flst_layer, iso_a, iso_b, wk_layer, fortschritt=None):
+    """Liefert (rohdaten, anzahl_geaenderte_flurstuecke) oder None bei Abbruch.
+
+    rohdaten: Liste von Dicts je Abschnittspaar mit flst_oid, kennzeichen,
+    wk_uuid, nutzung_wekl, flaeche_a, flaeche_b (None = Abschnitt existiert in
+    dem Zustand nicht), geom_a, geom_b, flst_geom. Ungefiltert - die
+    Nutzerschwellen wirken erst in _klassifizieren()."""
+    crs = flst_layer.crs()
+    wk_geoms, wk_attrs, index = _wertklassen_einlesen(wk_layer, crs)
+
+    zustand_a = _flurstuecke_lesen(flst_layer, iso_a)
+    zustand_b = _flurstuecke_lesen(flst_layer, iso_b)
+
+    # Vorfilter: exakter Geometrievergleich. Unabhaengig von den
+    # Nutzerschwellen - sonst wuerde ein spaeter gesenkter Schwellwert Faelle
+    # nicht finden, die gar nicht berechnet wurden.
+    relevante = []
+    for oid in set(zustand_a) | set(zustand_b):
+        a, b = zustand_a.get(oid), zustand_b.get(oid)
+        if a is None or b is None:
+            relevante.append(oid)
             continue
+        ga, gb = a[0], b[0]
+        if ga is None or gb is None or ga.isEmpty() or gb.isEmpty():
+            if (ga is None or ga.isEmpty()) != (gb is None or gb.isEmpty()):
+                relevante.append(oid)
+            continue
+        if not ga.equals(gb):
+            relevante.append(oid)
 
-        oid = feat["oid"] if oid_feld_idx >= 0 else str(feat.id())
-        anzeige_geom_flurstueck = volle_geom_je_oid.get(oid, original_geom)
+    if fortschritt is not None:
+        fortschritt.setMaximum(max(len(relevante), 1))
 
-        test_geom = original_geom
-        if hin_transform is not None:
-            test_geom = QgsGeometry(original_geom)
-            test_geom.transform(hin_transform)
+    rohdaten = []
+    for i, oid in enumerate(relevante):
+        if fortschritt is not None:
+            fortschritt.setValue(i)
+            if fortschritt.wasCanceled():
+                return None
 
-        betroffen = []
-        for wk_fid in index.intersects(test_geom.boundingBox()):
-            wk_geom = wk_geom_cache.get(wk_fid)
-            if wk_geom is None or not wk_geom.intersects(test_geom):
-                continue
-            anzeige_geom = wk_geom
-            if rueck_transform is not None:
-                anzeige_geom = QgsGeometry(wk_geom)
-                anzeige_geom.transform(rueck_transform)
-            eintrag = dict(wk_attr_cache[wk_fid])
-            eintrag["geometrie"] = anzeige_geom
-            betroffen.append(eintrag)
+        a, b = zustand_a.get(oid), zustand_b.get(oid)
+        geom_a = _sichere_geom(a[0]) if a else None
+        geom_b = _sichere_geom(b[0]) if b else None
+        abschnitte_a = _abschnitte_bilden(geom_a, wk_geoms, index) if geom_a else {}
+        abschnitte_b = _abschnitte_bilden(geom_b, wk_geoms, index) if geom_b else {}
+        kennzeichen = (b or a)[1]
+        flst_geom = geom_b or geom_a
 
-        if betroffen:
-            ergebnisse.append({
-                "oid": oid,
-                "geometrie": anzeige_geom_flurstueck,
-                "wertklassenflaechen": betroffen,
+        for wk_fid in set(abschnitte_a) | set(abschnitte_b):
+            ab_a, ab_b = abschnitte_a.get(wk_fid), abschnitte_b.get(wk_fid)
+            rohdaten.append({
+                "flst_oid": oid,
+                "kennzeichen": kennzeichen,
+                "wk_uuid": wk_attrs[wk_fid]["uuid"],
+                "nutzung_wekl": wk_attrs[wk_fid]["nutzung_wekl"],
+                "flaeche_a": ab_a.area() if ab_a else None,
+                "flaeche_b": ab_b.area() if ab_b else None,
+                "geom_a": ab_a,
+                "geom_b": ab_b,
+                "flst_geom": flst_geom,
             })
 
-    return ergebnisse
+    if fortschritt is not None:
+        fortschritt.setValue(fortschritt.maximum())
+
+    rohdaten.sort(key=lambda r: (r["kennzeichen"] or r["flst_oid"], r["wk_uuid"]))
+    return rohdaten, len(relevante)
+
+
+# --------------------------------------------------------------------------
+# Klassifizierungsphase (bei jeder Filteraenderung, billig)
+# --------------------------------------------------------------------------
+
+def _klassifizieren(rohdaten, min_delta, min_flaeche, splitter_zeigen):
+    """Liefert (sichtbare Eintraege, Zaehler je Status inkl. 'unveraendert'
+    und ausgeblendeter Splitter). Reine Zahlenvergleiche, keine Geometrie."""
+    sichtbar = []
+    zaehler = {wert: 0 for wert in STATUS_TEXT}
+    zaehler["unveraendert"] = 0
+    for r in rohdaten:
+        a, b = r["flaeche_a"], r["flaeche_b"]
+        if a is not None and b is not None:
+            delta = b - a
+            if abs(delta) < min_delta:
+                zaehler["unveraendert"] += 1
+                continue
+            status = "veraendert"
+        elif b is not None:
+            delta = b
+            status = "neu" if b >= min_flaeche else "splitter_neu"
+        else:
+            delta = -a
+            status = "entfallen" if a >= min_flaeche else "splitter_entfallen"
+        zaehler[status] += 1
+        if status.startswith("splitter") and not splitter_zeigen:
+            continue
+        sichtbar.append(dict(r, status=status, delta=delta))
+    return sichtbar, zaehler
+
+
+def _flaeche_text(wert, vorzeichen=False):
+    if wert is None:
+        return "–"
+    text = f"{wert:+.2f}" if vorzeichen else f"{wert:.2f}"
+    return text.replace(".", ",")
+
+
+# --------------------------------------------------------------------------
+# Einstieg
+# --------------------------------------------------------------------------
+
+def oeffne_wertklassen_dialog(iface, plugin):
+    """Oeffnet das Fenster - oder holt ein bereits offenes nach vorne."""
+    vorhanden = getattr(plugin, "_wertklassen_dialog", None)
+    if vorhanden is not None and not sip.isdeleted(vorhanden) and vorhanden.isVisible():
+        vorhanden.raise_()
+        vorhanden.activateWindow()
+        return vorhanden
+
+    # Elternfenster = QGIS-Hauptfenster: bleibt sichtbar, wenn der
+    # Hauptdialog geschlossen wird.
+    dlg = WertklassenDialog(iface, plugin, iface.mainWindow())
+    dlg.setAttribute(Qt.WA_DeleteOnClose)
+    plugin._wertklassen_dialog = dlg
+    dlg.show()
+    dlg.raise_()
+    dlg.activateWindow()
+    return dlg
 
 
 class WertklassenDialog(QDialog):
-    """crs: CRS, in dem ALLE Geometrien in 'ergebnisse' vorliegen (siehe
-    _ermittle_betroffene_wertklassen - einheitlich das diff_crs)."""
+    SPALTEN = ["Flurstück / Wertklassenfläche", "Nutzung Wertklasse", "Status",
+               "Fläche A [m²]", "Fläche B [m²]", "Δ [m²]"]
 
-    def __init__(self, iface, ergebnisse, crs, parent=None):
+    def __init__(self, iface, plugin, parent=None):
         super().__init__(parent)
         self.iface = iface
-        self._crs = crs
-        anzahl_wk_gesamt = len({wk["uuid"] for e in ergebnisse for wk in e["wertklassenflaechen"]})
-        self.setWindowTitle(
-            f"Betroffene Wertklassenflächen ({len(ergebnisse)} Flurstück(e), "
-            f"{anzahl_wk_gesamt} Wertklassenfläche(n))"
-        )
-        self.setMinimumSize(680, 520)
+        self.plugin = plugin
+        self._interne_quellen = []  # nicht geladene Layer am Leben halten
+        self._crs = QgsCoordinateReferenceSystem()
+        self.setWindowTitle("Wertklassen-Abschnitte vergleichen")
+        self.setMinimumSize(820, 640)
 
         layout = QVBoxLayout(self)
 
+        # --- Datengrundlage -------------------------------------------------
+        grundlage = QGroupBox("Datengrundlage")
+        form = QFormLayout(grundlage)
+        self.quelle_combo = QComboBox()
+        self.zeitpunkt_a_combo = QComboBox()
+        self.zeitpunkt_b_combo = QComboBox()
+        form.addRow("Flurstücke:", self.quelle_combo)
+        form.addRow("Zeitpunkt A (älterer Stand):", self.zeitpunkt_a_combo)
+        form.addRow("Zeitpunkt B (neuerer Stand):", self.zeitpunkt_b_combo)
+        self.berechnen_button = QPushButton("Abschnitte berechnen")
+        self.berechnen_button.clicked.connect(self._berechnen)
+        form.addRow(self.berechnen_button)
+        layout.addWidget(grundlage)
+
+        # --- Filter ----------------------------------------------------------
+        filter_box = QGroupBox("Filter (wirken sofort, ohne neue Berechnung)")
+        filter_form = QFormLayout(filter_box)
+        self.min_delta_spin = QDoubleSpinBox()
+        self.min_flaeche_spin = QDoubleSpinBox()
+        for spin in (self.min_delta_spin, self.min_flaeche_spin):
+            spin.setDecimals(2)
+            spin.setRange(0.0, 100000.0)
+            spin.setSingleStep(0.5)
+            spin.setSuffix(" m²")
+        self.splitter_check = QCheckBox("Splitter unter der Mindestgröße anzeigen")
+        filter_form.addRow("Mindest-Flächendifferenz (veränderte Abschnitte):", self.min_delta_spin)
+        filter_form.addRow("Mindestgröße (neue/entfallene Abschnitte):", self.min_flaeche_spin)
+        filter_form.addRow(self.splitter_check)
+        layout.addWidget(filter_box)
+
+        self.info_label = QLabel()
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label)
+
+        # --- Ergebnis --------------------------------------------------------
         self.baum = QTreeWidget()
-        self.baum.setColumnCount(2)
-        self.baum.setHeaderLabels(["Flurstück / Wertklassenfläche", "Nutzung Wertklasse"])
+        self.baum.setColumnCount(len(self.SPALTEN))
+        self.baum.setHeaderLabels(self.SPALTEN)
+        self.baum.itemDoubleClicked.connect(self._bei_doppelklick_zoomen)
         layout.addWidget(self.baum)
 
-        for eintrag in ergebnisse:
-            anzahl = len(eintrag["wertklassenflaechen"])
-            titel = f"AX_Flurstueck – oid={eintrag['oid']}  ({anzahl} Wertklassenfläche{'n' if anzahl != 1 else ''})"
-            top = QTreeWidgetItem([titel, ""])
+        button_row = QHBoxLayout()
+        for text, slot in (
+            ("Auf Auswahl zoomen", self._zoomen),
+            ("Auswahl aufleuchten lassen", self._aufleuchten_lassen),
+            ("OID/UUID kopieren", self._id_kopieren),
+            ("Exportieren...", self._exportieren),
+            ("Schließen", self.close),
+        ):
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            button_row.addWidget(button)
+        layout.addLayout(button_row)
+
+        # Filter entprellen: Tippen im Zahlenfeld loest nicht bei jeder
+        # Ziffer einen Neuaufbau aus.
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(300)
+        self._filter_timer.timeout.connect(self._filter_anwenden)
+
+        self._schwellen_laden()
+        self.min_delta_spin.valueChanged.connect(self._filter_timer.start)
+        self.min_flaeche_spin.valueChanged.connect(self._filter_timer.start)
+        self.splitter_check.toggled.connect(self._filter_timer.start)
+
+        self.quelle_combo.currentIndexChanged.connect(self._lieferungen_befuellen)
+        self._quellen_befuellen()
+        self._gespeichertes_ergebnis_anzeigen()
+
+    # ------------------------------------------------------------------
+    # Datengrundlage
+    # ------------------------------------------------------------------
+
+    def _quellen_befuellen(self):
+        self.quelle_combo.blockSignals(True)
+        self.quelle_combo.clear()
+        pfade = set()
+        for layer in QgsProject.instance().mapLayers().values():
+            if _ist_flurstueck_quelle(layer):
+                pfad = _gpkg_path_from_layer(layer)
+                pfade.add(os.path.normcase(os.path.abspath(pfad)))
+                self.quelle_combo.addItem(f"{layer.name()}  ({os.path.basename(pfad)})", layer)
+
+        # Rueckfall: zuletzt im Import-Reiter gewaehltes GeoPackage, auch wenn
+        # AX_Flurstueck daraus gerade nicht im Projekt geladen ist.
+        letztes = getattr(self.plugin, "letztes_gpkg", None)
+        if letztes and os.path.exists(letztes) and os.path.normcase(os.path.abspath(letztes)) not in pfade:
+            intern = QgsVectorLayer(f"{letztes}|layername={FLURSTUECK_TABELLE}", FLURSTUECK_TABELLE, "ogr")
+            if _ist_flurstueck_quelle(intern):
+                self._interne_quellen.append(intern)
+                self.quelle_combo.addItem(
+                    f"{FLURSTUECK_TABELLE} aus {os.path.basename(letztes)} (nicht geladen)", intern
+                )
+        self.quelle_combo.blockSignals(False)
+
+        if self.quelle_combo.count() == 0:
+            self.berechnen_button.setEnabled(False)
+            self.info_label.setText(
+                "Keine Flurstücksdaten gefunden. Bitte zuerst im Reiter 'Import' "
+                f"{FLURSTUECK_TABELLE} aus dem NAS-GeoPackage laden."
+            )
+            return
+        self._lieferungen_befuellen()
+
+    def _lieferungen_befuellen(self):
+        self.zeitpunkt_a_combo.clear()
+        self.zeitpunkt_b_combo.clear()
+        layer = self.quelle_combo.currentData()
+        if layer is None:
+            return
+        lieferungen = _lieferungen_lesen(_gpkg_path_from_layer(layer))
+        for dateiname, abgabe_ende in lieferungen:
+            label = f"{_datum_de(abgabe_ende)}  ({dateiname})"
+            self.zeitpunkt_a_combo.addItem(label, abgabe_ende)
+            self.zeitpunkt_b_combo.addItem(label, abgabe_ende)
+        if len(lieferungen) < 2:
+            self.berechnen_button.setEnabled(False)
+            self.info_label.setText(
+                "Für einen Abschnittsvergleich werden mindestens zwei eingespielte "
+                "Lieferungen benötigt."
+            )
+            return
+        self.berechnen_button.setEnabled(True)
+        # Vorauswahl: vorletzte und letzte Lieferung
+        self.zeitpunkt_a_combo.setCurrentIndex(len(lieferungen) - 2)
+        self.zeitpunkt_b_combo.setCurrentIndex(len(lieferungen) - 1)
+
+    def _gespeichertes_ergebnis_anzeigen(self):
+        """Beim erneuten Oeffnen das letzte Ergebnis wiederherstellen - ohne
+        neue Verschneidung."""
+        analyse = getattr(self.plugin, "wertklassen_analyse", None)
+        if not analyse:
+            return
+        ziel = os.path.normcase(os.path.abspath(analyse["gpkg_pfad"]))
+        for i in range(self.quelle_combo.count()):
+            layer = self.quelle_combo.itemData(i)
+            if os.path.normcase(os.path.abspath(_gpkg_path_from_layer(layer))) == ziel:
+                self.quelle_combo.setCurrentIndex(i)
+                break
+        iso_a, iso_b = analyse["zeitraum"]
+        for combo, iso in ((self.zeitpunkt_a_combo, iso_a), (self.zeitpunkt_b_combo, iso_b)):
+            idx = combo.findData(iso)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        self._filter_anwenden()
+
+    # ------------------------------------------------------------------
+    # Schwellen
+    # ------------------------------------------------------------------
+
+    def _schwellen_laden(self):
+        s = QgsSettings()
+        self.min_delta_spin.setValue(float(s.value(SETTINGS_MIN_DELTA, STANDARD_MIN_DELTA)))
+        self.min_flaeche_spin.setValue(float(s.value(SETTINGS_MIN_FLAECHE, STANDARD_MIN_FLAECHE)))
+        self.splitter_check.setChecked(str(s.value(SETTINGS_SPLITTER, "false")).lower() == "true")
+
+    def _schwellen_speichern(self):
+        s = QgsSettings()
+        s.setValue(SETTINGS_MIN_DELTA, self.min_delta_spin.value())
+        s.setValue(SETTINGS_MIN_FLAECHE, self.min_flaeche_spin.value())
+        s.setValue(SETTINGS_SPLITTER, "true" if self.splitter_check.isChecked() else "false")
+
+    # ------------------------------------------------------------------
+    # Berechnen
+    # ------------------------------------------------------------------
+
+    def _berechnen(self):
+        layer = self.quelle_combo.currentData()
+        if layer is None:
+            return
+        iso_a = self.zeitpunkt_a_combo.currentData()
+        iso_b = self.zeitpunkt_b_combo.currentData()
+        if iso_a == iso_b:
+            QMessageBox.warning(self, "Fehler", "Zeitpunkt A und B sind identisch.")
+            return
+        if iso_a > iso_b:
+            iso_a, iso_b = iso_b, iso_a
+
+        gpkg_pfad = _gpkg_path_from_layer(layer)
+        wk_layer = _beschaffe_wertklassen_layer(self, gpkg_pfad)
+        if wk_layer is None:
+            return
+
+        fortschritt = QProgressDialog("Abschnitte werden verschnitten...", "Abbrechen", 0, 1, self)
+        fortschritt.setWindowTitle("Wertklassen-Abschnitte")
+        fortschritt.setWindowModality(Qt.WindowModal)
+        fortschritt.setMinimumDuration(500)
+        try:
+            ergebnis = _berechne_abschnitte(layer, iso_a, iso_b, wk_layer, fortschritt)
+        finally:
+            fortschritt.close()
+        if ergebnis is None:
+            self.iface.messageBar().pushInfo("NAS2QGIS", "Abschnittsberechnung abgebrochen.")
+            return
+        rohdaten, anzahl_flurstuecke = ergebnis
+
+        alt = getattr(self.plugin, "wertklassen_analyse", None) or {}
+        self.plugin.wertklassen_analyse = {
+            "gpkg_pfad": gpkg_pfad,
+            "zeitraum": (iso_a, iso_b),
+            "crs": layer.crs(),
+            "rohdaten": rohdaten,
+            "anzahl_flurstuecke": anzahl_flurstuecke,
+            "layer": alt.get("layer"),  # wird wiederverwendet statt verdoppelt
+        }
+        self._filter_anwenden()
+
+    # ------------------------------------------------------------------
+    # Klassifizieren + Anzeige
+    # ------------------------------------------------------------------
+
+    def _filter_anwenden(self):
+        self._filter_timer.stop()
+        self._schwellen_speichern()
+        analyse = getattr(self.plugin, "wertklassen_analyse", None)
+        if not analyse:
+            return
+        sichtbar, zaehler = _klassifizieren(
+            analyse["rohdaten"],
+            self.min_delta_spin.value(),
+            self.min_flaeche_spin.value(),
+            self.splitter_check.isChecked(),
+        )
+        self._layer_aktualisieren(analyse, sichtbar)
+        self._baum_aufbauen(sichtbar, analyse["crs"])
+        self._zusammenfassung(analyse, zaehler)
+
+    def _layer_aktualisieren(self, analyse, sichtbar):
+        iso_a, iso_b = analyse["zeitraum"]
+        name = f"Wertklassen-Abschnitte {iso_a[:10]} bis {iso_b[:10]}"
+        layer = analyse.get("layer")
+        if layer is None or sip.isdeleted(layer) or QgsProject.instance().mapLayer(layer.id()) is None:
+            layer = QgsVectorLayer(f"MultiPolygon?crs={analyse['crs'].authid()}", name, "memory")
+            felder = QgsFields()
+            for feldname, typ in (
+                ("status", QVariant.String), ("flst_oid", QVariant.String),
+                ("flst_kennz", QVariant.String), ("wk_uuid", QVariant.String),
+                ("nutzung_wekl", QVariant.String), ("flaeche_a", QVariant.Double),
+                ("flaeche_b", QVariant.Double), ("delta", QVariant.Double),
+            ):
+                felder.append(QgsField(feldname, typ))
+            layer.dataProvider().addAttributes(felder)
+            layer.updateFields()
+            style_abschnitt_layer(layer)
+            QgsProject.instance().addMapLayer(layer)
+            analyse["layer"] = layer
+        layer.setName(name)
+
+        features = []
+        for e in sichtbar:
+            geom = e["geom_a"] if e["status"] in ("entfallen", "splitter_entfallen") else e["geom_b"]
+            if geom is None:
+                continue
+            geom = QgsGeometry(geom)
+            geom.convertToMultiType()
+            feat = QgsFeature(layer.fields())
+            feat.setGeometry(geom)
+            feat.setAttributes([
+                e["status"], e["flst_oid"], e["kennzeichen"], e["wk_uuid"], e["nutzung_wekl"],
+                e["flaeche_a"], e["flaeche_b"], e["delta"],
+            ])
+            features.append(feat)
+
+        provider = layer.dataProvider()
+        provider.truncate()
+        provider.addFeatures(features)
+        layer.updateExtents()
+        layer.triggerRepaint()
+
+    def _baum_aufbauen(self, sichtbar, crs):
+        self._crs = crs
+        self.baum.clear()
+        gruppen = {}
+        for e in sichtbar:
+            gruppen.setdefault(e["flst_oid"], []).append(e)
+
+        for oid, eintraege in gruppen.items():
+            erster = eintraege[0]
+            n = len(eintraege)
+            kopf = f"{erster['kennzeichen']}  –  " if erster["kennzeichen"] else ""
+            top = QTreeWidgetItem([f"{kopf}oid={oid}  ({n} Abschnitt{'e' if n != 1 else ''})"])
             top.setData(0, Qt.UserRole, {
-                "art": "flurstueck", "oid": eintrag["oid"], "geometrie": eintrag["geometrie"],
+                "art": "flurstueck", "oid": oid, "kennzeichen": erster["kennzeichen"],
+                "geometrien": [erster["flst_geom"]],
             })
             font = top.font(0)
             font.setBold(True)
             top.setFont(0, font)
-            for wk in eintrag["wertklassenflaechen"]:
-                nunk_wekl = " ".join(
-                    str(teil) for teil in (wk["nunk"], wk["wekl"]) if teil is not None
-                )
-                kind = QTreeWidgetItem([str(wk["uuid"]), nunk_wekl])
+
+            for e in eintraege:
+                kind = QTreeWidgetItem([
+                    e["wk_uuid"], e["nutzung_wekl"], STATUS_TEXT[e["status"]],
+                    _flaeche_text(e["flaeche_a"]), _flaeche_text(e["flaeche_b"]),
+                    _flaeche_text(e["delta"], vorzeichen=True),
+                ])
+                kind.setForeground(2, QColor(*(int(v) for v in STATUS_FARBE[e["status"]].split(","))))
+                for spalte in (3, 4, 5):
+                    kind.setTextAlignment(spalte, Qt.AlignRight | Qt.AlignVCenter)
                 kind.setData(0, Qt.UserRole, {
-                    "art": "wertklassenflaeche", "uuid": wk["uuid"], "geometrie": wk["geometrie"],
+                    "art": "abschnitt", "uuid": e["wk_uuid"],
+                    "geometrien": [g for g in (e["geom_a"], e["geom_b"]) if g is not None],
                 })
                 top.addChild(kind)
             self.baum.addTopLevelItem(top)
 
         self.baum.expandAll()
-        for spalte in range(2):
+        for spalte in range(len(self.SPALTEN)):
             self.baum.resizeColumnToContents(spalte)
 
-        button_row = QHBoxLayout()
-        zoom_button = QPushButton("Auf Auswahl zoomen")
-        zoom_button.clicked.connect(self._zoomen)
-        blink_button = QPushButton("Auswahl aufleuchten lassen")
-        blink_button.clicked.connect(self._aufleuchten_lassen)
-        oid_button = QPushButton("OID/UUID kopieren")
-        oid_button.clicked.connect(self._id_kopieren)
-        export_button = QPushButton("Exportieren...")
-        export_button.clicked.connect(self._exportieren)
-        schliessen_button = QPushButton("Schließen")
-        schliessen_button.clicked.connect(self.close)
-        button_row.addWidget(zoom_button)
-        button_row.addWidget(blink_button)
-        button_row.addWidget(oid_button)
-        button_row.addWidget(export_button)
-        button_row.addWidget(schliessen_button)
-        layout.addLayout(button_row)
+    def _zusammenfassung(self, analyse, zaehler):
+        iso_a, iso_b = analyse["zeitraum"]
+        splitter = zaehler["splitter_neu"] + zaehler["splitter_entfallen"]
+        splitter_text = (
+            f"{splitter} Splitter" + ("" if self.splitter_check.isChecked() else " (ausgeblendet)")
+        )
+        self.info_label.setText(
+            f"<b>Ergebnis {_datum_de(iso_a)} → {_datum_de(iso_b)}:</b> "
+            f"{analyse['anzahl_flurstuecke']} geometrisch geänderte Flurstücke · "
+            f"{zaehler['neu']} neu · {zaehler['entfallen']} entfallen · "
+            f"{zaehler['veraendert']} verändert · {splitter_text} · "
+            f"{zaehler['unveraendert']} unter Mindest-Flächendifferenz"
+        )
 
-        self.baum.itemDoubleClicked.connect(self._bei_doppelklick_zoomen)
+    # ------------------------------------------------------------------
+    # Aktionen
+    # ------------------------------------------------------------------
 
     def _bei_doppelklick_zoomen(self, item, spalte):
         self.baum.setCurrentItem(item)
@@ -379,37 +744,36 @@ class WertklassenDialog(QDialog):
             return None
         return auswahl[0].data(0, Qt.UserRole)
 
-    def _geom_in_projekt_crs(self, geom):
+    def _in_projekt_crs(self, geom):
         ziel_crs = self.iface.mapCanvas().mapSettings().destinationCrs()
         if not self._crs.isValid() or self._crs == ziel_crs:
             return geom
-        transform = QgsCoordinateTransform(self._crs, ziel_crs, QgsProject.instance())
         kopie = QgsGeometry(geom)
-        kopie.transform(transform)
+        kopie.transform(QgsCoordinateTransform(self._crs, ziel_crs, QgsProject.instance()))
         return kopie
 
     def _zoomen(self):
         eintrag = self._ausgewaehltes_element()
-        if eintrag is None:
+        if eintrag is None or not eintrag["geometrien"]:
             return
-        geom = self._geom_in_projekt_crs(eintrag["geometrie"])
-        bbox = geom.boundingBox()
-        # Bei sehr schmalen Geometrien (z.B. duenne Differenzflaechen bei
-        # geometrisch geaenderten Flurstuecken) reicht ein reiner
-        # Skalierungsfaktor nicht aus - deshalb zusaetzlich ein
-        # Mindestpuffer in Kartenmasseinheiten, damit man wirklich etwas sieht.
-        puffer = max(bbox.width(), bbox.height()) * 0.5
-        puffer = max(puffer, 10)  # Mindestens 10 Karteneinheiten (i.d.R. Meter)
-        bbox = bbox.buffered(puffer)
+        bbox = None
+        for geom in eintrag["geometrien"]:
+            box = self._in_projekt_crs(geom).boundingBox()
+            if bbox is None:
+                bbox = box
+            else:
+                bbox.combineExtentWith(box)
+        # Mindestpuffer, damit auch sehr schmale Abschnitte sichtbar werden
+        puffer = max(max(bbox.width(), bbox.height()) * 0.5, 10)
         canvas = self.iface.mapCanvas()
-        canvas.setExtent(bbox)
+        canvas.setExtent(bbox.buffered(puffer))
         canvas.refresh()
 
     def _aufleuchten_lassen(self):
         eintrag = self._ausgewaehltes_element()
-        if eintrag is None:
+        if eintrag is None or not eintrag["geometrien"]:
             return
-        self.iface.mapCanvas().flashGeometries([eintrag["geometrie"]], self._crs)
+        self.iface.mapCanvas().flashGeometries(eintrag["geometrien"], self._crs)
 
     def _id_kopieren(self):
         eintrag = self._ausgewaehltes_element()
@@ -420,8 +784,11 @@ class WertklassenDialog(QDialog):
         self.iface.messageBar().pushInfo("NAS2QGIS", f"Kopiert: {wert}")
 
     def _exportieren(self):
+        if self.baum.topLevelItemCount() == 0:
+            QMessageBox.information(self, "Nichts zu exportieren", "Die Ergebnisliste ist leer.")
+            return
         pfad, _ = QFileDialog.getSaveFileName(
-            self, "Als CSV exportieren", "wertklassenflaechen.csv", "CSV-Datei (*.csv)"
+            self, "Als CSV exportieren", "wertklassen_abschnitte.csv", "CSV-Datei (*.csv)"
         )
         if not pfad:
             return
@@ -430,13 +797,18 @@ class WertklassenDialog(QDialog):
         try:
             with open(pfad, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f, delimiter=";")
-                writer.writerow(["Flurstueck_OID", "Wertklassenflaeche_UUID", "Nutzung_Wertklasse"])
+                writer.writerow([
+                    "Flurstueck_OID", "Flurstueckskennzeichen", "Wertklassenflaeche_UUID",
+                    "Nutzung_Wertklasse", "Status", "Flaeche_A_m2", "Flaeche_B_m2", "Delta_m2",
+                ])
                 for i in range(self.baum.topLevelItemCount()):
                     top = self.baum.topLevelItem(i)
-                    flurstueck_oid = top.data(0, Qt.UserRole)["oid"]
+                    daten = top.data(0, Qt.UserRole)
                     for j in range(top.childCount()):
                         kind = top.child(j)
-                        writer.writerow([flurstueck_oid, kind.text(0), kind.text(1)])
+                        writer.writerow(
+                            [daten["oid"], daten["kennzeichen"]] + [kind.text(s) for s in range(len(self.SPALTEN))]
+                        )
         except OSError as exc:
             QMessageBox.critical(self, "Fehler beim Export", str(exc))
             return

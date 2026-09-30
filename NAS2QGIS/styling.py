@@ -137,3 +137,25 @@ def style_diff_layer(layer):
     kategorien.append(QgsRendererCategory("", _diff_symbol(geom_typ, "97,97,97", "158,158,158,110"), "sonstige"))
     layer.setRenderer(QgsCategorizedSymbolRenderer("vergleichsstatus", kategorien))
     layer.triggerRepaint()
+
+
+# Farben des Wertklassen-Abschnitte-Layers je Status (siehe wertklassen_dialog.py):
+# (Wert im Feld 'status', Legendentext, "r,g,b" Kontur, "r,g,b,a" Fuellung)
+ABSCHNITT_KATEGORIEN = [
+    ("neu", "neuer Abschnitt", "46,125,50", "76,175,80,120"),
+    ("entfallen", "entfallener Abschnitt", "198,40,40", "244,67,54,120"),
+    ("veraendert", "Abschnittsfläche verändert", "230,126,0", "255,167,38,130"),
+    ("splitter_neu", "Splitter (neu)", "97,97,97", "158,158,158,90"),
+    ("splitter_entfallen", "Splitter (entfallen)", "97,97,97", "158,158,158,90"),
+]
+
+
+def style_abschnitt_layer(layer):
+    """Faerbt den Wertklassen-Abschnitte-Layer nach dem Feld 'status' ein."""
+    geom_typ = layer.geometryType()
+    kategorien = [
+        QgsRendererCategory(wert, _diff_symbol(geom_typ, kontur, fuellung), text)
+        for wert, text, kontur, fuellung in ABSCHNITT_KATEGORIEN
+    ]
+    layer.setRenderer(QgsCategorizedSymbolRenderer("status", kategorien))
+    layer.triggerRepaint()

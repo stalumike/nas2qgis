@@ -1,9 +1,9 @@
 """
 Ein Fenster, zwei Reiter - fasst Import und Vergleich unter einer
-gemeinsamen Schaltflaeche zusammen. Die Wertklassenflaechen-Ermittlung ist
-bewusst kein dritter Reiter, sondern ein Button im Vergleich-Reiter (siehe
-vergleich_dialog.py), da sie einen bereits durchgefuehrten Vergleich
-voraussetzt - kein eigenstaendiger Einstiegspunkt.
+gemeinsamen Schaltflaeche zusammen. Der Wertklassen-Abschnittsvergleich ist
+(vorerst, bis zur Dialog-Konsolidierung) ein Button im Vergleich-Reiter
+(siehe vergleich_dialog.py) und oeffnet ein eigenes Fenster. Er setzt keinen
+vorherigen Vergleich voraus.
 """
 
 from qgis.PyQt.QtWidgets import QDialog, QTabWidget, QVBoxLayout

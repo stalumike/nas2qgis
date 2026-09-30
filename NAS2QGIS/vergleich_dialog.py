@@ -95,7 +95,7 @@ class VergleichTab(QWidget):
         self.attr_button.clicked.connect(self._zeige_attributaenderungen)
         layout.addWidget(self.attr_button)
 
-        wertklassen_button = QPushButton("Betroffene Wertklassenflächen ermitteln...")
+        wertklassen_button = QPushButton("Wertklassen-Abschnitte vergleichen...")
         wertklassen_button.clicked.connect(self._oeffne_wertklassen_dialog)
         layout.addWidget(wertklassen_button)
 
@@ -356,8 +356,9 @@ class VergleichTab(QWidget):
         self.blink_controller.layer_setzen(layer_a, layer_b)
 
         # Ergebnis dieses Vergleichs JE OBJEKTART merken (siehe plugin.vergleiche):
-        # Attributaenderungen-Fenster, Blinkvergleich und Wertklassenflaechen-
-        # Ermittlung greifen darauf zu - ein spaeterer Vergleich einer anderen
+        # Attributaenderungen-Fenster und Blinkvergleich greifen darauf zu
+        # (der Wertklassen-Abschnittsvergleich NICHT - der liest die Zustaende
+        # selbst aus dem GeoPackage) - ein spaeterer Vergleich einer anderen
         # Objektart ueberschreibt diesen Eintrag nicht.
         self.plugin.vergleiche[layer.name()] = {
             "diff_layer": layer_diff,
