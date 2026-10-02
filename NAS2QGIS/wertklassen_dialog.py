@@ -2,8 +2,8 @@
 Abschnittsvergleich Flurstueck x Wertklassenflaeche zwischen zwei Staenden.
 
 Ablauf:
-  1. Aus der SCD2-Historie des NAS-GeoPackages werden AX_Flurstueck-Zustand A
-     und Zustand B gelesen (Vorauswahl: vorletzte und letzte Lieferung, im
+  1. Aus der SCD2-Historie des NAS-GeoPackages (intern geoeffnet, nicht ins
+     Projekt geladen) werden AX_Flurstueck-Zustand A und Zustand B gelesen (Vorauswahl: vorletzte und letzte Lieferung, im
      Dialog frei aenderbar). Ein vorheriger Vergleich im Reiter 'Vergleich'
      ist NICHT noetig.
   2. Vorfilter: Nur Flurstuecke, die neu sind, entfallen sind oder deren
@@ -65,7 +65,14 @@ from qgis.core import (
 )
 
 from .styling import ABSCHNITT_KATEGORIEN, style_abschnitt_layer
-from .vergleich_dialog import _datum_de, _gpkg_path_from_layer, _lieferungen_lesen, _zustand_ausdruck
+from .vergleich_dialog import (
+    _datum_de,
+    _lieferungen_lesen,
+    _pfad_normiert,
+    _zustand_ausdruck,
+    oeffne_nas_tabelle,
+    projekt_crs_sicherstellen,
+)
 
 WERTKLASSEN_TABELLE = "AB-Wertklassenflaechen"
 WERTKLASSEN_DATEINAME = "AB-Wertklassenflaechen.gpkg"
@@ -96,15 +103,6 @@ STATUS_FARBE = {wert: kontur for wert, _, kontur, _ in ABSCHNITT_KATEGORIEN}
 # --------------------------------------------------------------------------
 # Datenquellen finden
 # --------------------------------------------------------------------------
-
-def _ist_flurstueck_quelle(layer):
-    if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
-        return False
-    if layer.providerType() != "ogr" or layer.fields().indexOf("gueltig_von") < 0:
-        return False
-    teile = layer.source().split("|")
-    return f"layername={FLURSTUECK_TABELLE}" in teile or layer.name() == FLURSTUECK_TABELLE
-
 
 def _finde_wertklassen_layer():
     """Geladener Layer, dessen Quelltabelle WERTKLASSEN_TABELLE heisst -
@@ -398,7 +396,8 @@ class WertklassenDialog(QDialog):
         super().__init__(parent)
         self.iface = iface
         self.plugin = plugin
-        self._interne_quellen = []  # nicht geladene Layer am Leben halten
+        self.gpkg_pfad = None
+        self._flst_layer = None  # intern geoeffnete AX_Flurstueck-Tabelle
         self._crs = QgsCoordinateReferenceSystem()
         self.setWindowTitle("Wertklassen-Abschnitte vergleichen")
         self.setMinimumSize(820, 640)
@@ -408,10 +407,16 @@ class WertklassenDialog(QDialog):
         # --- Datengrundlage -------------------------------------------------
         grundlage = QGroupBox("Datengrundlage")
         form = QFormLayout(grundlage)
-        self.quelle_combo = QComboBox()
+        gpkg_row = QHBoxLayout()
+        self.gpkg_label = QLabel()
+        self.gpkg_label.setWordWrap(True)
+        gpkg_button = QPushButton("Auswählen...")
+        gpkg_button.clicked.connect(self._gpkg_waehlen)
+        gpkg_row.addWidget(self.gpkg_label, stretch=1)
+        gpkg_row.addWidget(gpkg_button)
         self.zeitpunkt_a_combo = QComboBox()
         self.zeitpunkt_b_combo = QComboBox()
-        form.addRow("Flurstücke:", self.quelle_combo)
+        form.addRow("NAS-GeoPackage:", gpkg_row)
         form.addRow("Zeitpunkt A (älterer Stand):", self.zeitpunkt_a_combo)
         form.addRow("Zeitpunkt B (neuerer Stand):", self.zeitpunkt_b_combo)
         self.berechnen_button = QPushButton("Abschnitte berechnen")
@@ -471,80 +476,66 @@ class WertklassenDialog(QDialog):
         self.min_flaeche_spin.valueChanged.connect(self._filter_timer.start)
         self.splitter_check.toggled.connect(self._filter_timer.start)
 
-        self.quelle_combo.currentIndexChanged.connect(self._lieferungen_befuellen)
-        self._quellen_befuellen()
-        self._gespeichertes_ergebnis_anzeigen()
+        # Gemeinsames GeoPackage mit Import-/Vergleich-Reiter; ein letztes
+        # Ergebnis wird nur wiederhergestellt, wenn es zu dieser Datei gehoert.
+        analyse = getattr(self.plugin, "wertklassen_analyse", None)
+        pfad = getattr(self.plugin, "letztes_gpkg", None) or (analyse or {}).get("gpkg_pfad")
+        self._quelle_setzen(pfad)
+        if analyse and _pfad_normiert(analyse["gpkg_pfad"]) == _pfad_normiert(pfad):
+            self._gespeichertes_ergebnis_anzeigen()
 
     # ------------------------------------------------------------------
     # Datengrundlage
     # ------------------------------------------------------------------
 
-    def _quellen_befuellen(self):
-        self.quelle_combo.blockSignals(True)
-        self.quelle_combo.clear()
-        pfade = set()
-        for layer in QgsProject.instance().mapLayers().values():
-            if _ist_flurstueck_quelle(layer):
-                pfad = _gpkg_path_from_layer(layer)
-                pfade.add(os.path.normcase(os.path.abspath(pfad)))
-                self.quelle_combo.addItem(f"{layer.name()}  ({os.path.basename(pfad)})", layer)
+    def _gpkg_waehlen(self):
+        start_ordner = os.path.dirname(self.gpkg_pfad) if self.gpkg_pfad else ""
+        pfad, _ = QFileDialog.getOpenFileName(
+            self, "NAS-GeoPackage wählen", start_ordner, "GeoPackage (*.gpkg)"
+        )
+        if pfad:
+            self.plugin.letztes_gpkg = pfad  # gilt auch fuer Import-/Vergleich-Reiter
+            self._quelle_setzen(pfad)
 
-        # Rueckfall: zuletzt im Import-Reiter gewaehltes GeoPackage, auch wenn
-        # AX_Flurstueck daraus gerade nicht im Projekt geladen ist.
-        letztes = getattr(self.plugin, "letztes_gpkg", None)
-        if letztes and os.path.exists(letztes) and os.path.normcase(os.path.abspath(letztes)) not in pfade:
-            intern = QgsVectorLayer(f"{letztes}|layername={FLURSTUECK_TABELLE}", FLURSTUECK_TABELLE, "ogr")
-            if _ist_flurstueck_quelle(intern):
-                self._interne_quellen.append(intern)
-                self.quelle_combo.addItem(
-                    f"{FLURSTUECK_TABELLE} aus {os.path.basename(letztes)} (nicht geladen)", intern
-                )
-        self.quelle_combo.blockSignals(False)
-
-        if self.quelle_combo.count() == 0:
-            self.berechnen_button.setEnabled(False)
-            self.info_label.setText(
-                "Keine Flurstücksdaten gefunden. Bitte zuerst im Reiter 'Import' "
-                f"{FLURSTUECK_TABELLE} aus dem NAS-GeoPackage laden."
-            )
-            return
-        self._lieferungen_befuellen()
-
-    def _lieferungen_befuellen(self):
+    def _quelle_setzen(self, pfad):
+        self.gpkg_pfad = pfad
+        self.gpkg_label.setText(pfad or "(noch nicht gewählt)")
+        self._flst_layer = None
         self.zeitpunkt_a_combo.clear()
         self.zeitpunkt_b_combo.clear()
-        layer = self.quelle_combo.currentData()
-        if layer is None:
+        self.berechnen_button.setEnabled(False)
+
+        if not pfad or not os.path.exists(pfad):
+            self.info_label.setText("Bitte ein NAS-GeoPackage wählen.")
             return
-        lieferungen = _lieferungen_lesen(_gpkg_path_from_layer(layer))
+        self._flst_layer = oeffne_nas_tabelle(pfad, FLURSTUECK_TABELLE)
+        if self._flst_layer is None:
+            self.info_label.setText(
+                f"Das GeoPackage enthält keine historisierte Tabelle '{FLURSTUECK_TABELLE}'."
+            )
+            return
+
+        lieferungen = _lieferungen_lesen(pfad)
         for dateiname, abgabe_ende in lieferungen:
             label = f"{_datum_de(abgabe_ende)}  ({dateiname})"
             self.zeitpunkt_a_combo.addItem(label, abgabe_ende)
             self.zeitpunkt_b_combo.addItem(label, abgabe_ende)
         if len(lieferungen) < 2:
-            self.berechnen_button.setEnabled(False)
             self.info_label.setText(
                 "Für einen Abschnittsvergleich werden mindestens zwei eingespielte "
                 "Lieferungen benötigt."
             )
             return
-        self.berechnen_button.setEnabled(True)
         # Vorauswahl: vorletzte und letzte Lieferung
         self.zeitpunkt_a_combo.setCurrentIndex(len(lieferungen) - 2)
         self.zeitpunkt_b_combo.setCurrentIndex(len(lieferungen) - 1)
+        self.berechnen_button.setEnabled(True)
+        self.info_label.setText("")
 
     def _gespeichertes_ergebnis_anzeigen(self):
         """Beim erneuten Oeffnen das letzte Ergebnis wiederherstellen - ohne
         neue Verschneidung."""
-        analyse = getattr(self.plugin, "wertklassen_analyse", None)
-        if not analyse:
-            return
-        ziel = os.path.normcase(os.path.abspath(analyse["gpkg_pfad"]))
-        for i in range(self.quelle_combo.count()):
-            layer = self.quelle_combo.itemData(i)
-            if os.path.normcase(os.path.abspath(_gpkg_path_from_layer(layer))) == ziel:
-                self.quelle_combo.setCurrentIndex(i)
-                break
+        analyse = self.plugin.wertklassen_analyse
         iso_a, iso_b = analyse["zeitraum"]
         for combo, iso in ((self.zeitpunkt_a_combo, iso_a), (self.zeitpunkt_b_combo, iso_b)):
             idx = combo.findData(iso)
@@ -573,7 +564,7 @@ class WertklassenDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _berechnen(self):
-        layer = self.quelle_combo.currentData()
+        layer = self._flst_layer
         if layer is None:
             return
         iso_a = self.zeitpunkt_a_combo.currentData()
@@ -584,7 +575,7 @@ class WertklassenDialog(QDialog):
         if iso_a > iso_b:
             iso_a, iso_b = iso_b, iso_a
 
-        gpkg_pfad = _gpkg_path_from_layer(layer)
+        gpkg_pfad = self.gpkg_pfad
         wk_layer = _beschaffe_wertklassen_layer(self, gpkg_pfad)
         if wk_layer is None:
             return
@@ -650,6 +641,7 @@ class WertklassenDialog(QDialog):
             layer.dataProvider().addAttributes(felder)
             layer.updateFields()
             style_abschnitt_layer(layer)
+            projekt_crs_sicherstellen(analyse["crs"])
             QgsProject.instance().addMapLayer(layer)
             analyse["layer"] = layer
         layer.setName(name)

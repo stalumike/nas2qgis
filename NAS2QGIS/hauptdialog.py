@@ -29,10 +29,13 @@ class HauptDialog(QDialog):
         layout.addWidget(self.tabs)
 
     def _tab_gewechselt(self, index):
-        # Der Vergleich-Reiter wird beim Oeffnen des Hauptdialogs einmalig
-        # aufgebaut - moeglicherweise BEVOR im Import-Reiter ueberhaupt ein
-        # Layer geladen wurde. Bei jedem Wechsel auf diesen Reiter die
-        # Layer-Liste neu einlesen, damit zwischenzeitlich geladene Layer
-        # (egal ob ueber den Import-Reiter oder anders) beruecksichtigt werden.
-        if self.tabs.widget(index) is self.vergleich_tab:
-            self.vergleich_tab.layer_liste_befuellen()
+        # Beide Reiter teilen sich das GeoPackage ueber plugin.letztes_gpkg.
+        # Beim Wechsel jeweils abgleichen: der Vergleich-Reiter liest dabei
+        # auch Objektarten und Lieferungen neu ein (z.B. direkt nach einem
+        # Import), der Import-Reiter uebernimmt ein im Vergleich gewaehltes
+        # GeoPackage.
+        widget = self.tabs.widget(index)
+        if widget is self.vergleich_tab:
+            self.vergleich_tab.quelle_aktualisieren()
+        elif widget is self.import_tab:
+            self.import_tab.gpkg_aktualisieren()

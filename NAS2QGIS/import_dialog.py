@@ -1,14 +1,21 @@
+"""
+Import-Reiter: spielt NAS-Lieferungen historisiert in ein GeoPackage ein.
+
+Bewusst KEIN Laden der Objektarten ins Projekt mehr: die Tabellen enthalten
+alle Objektversionen (SCD2-Historie), ein direkt geladener Layer zeigte
+deshalb jedes geaenderte Objekt mehrfach. Vergleich und Wertklassen-
+Abschnittsvergleich lesen die Tabellen intern; sichtbar werden nur die
+daraus gebildeten Zustands-/Ergebnis-Layer.
+"""
+
 import os
 import sqlite3
 
-from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
-    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -17,115 +24,9 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from qgis.core import QgsVectorLayer, QgsProject
-
 from .parser import parse_delivery_metadata, verfahrensnummer_aus_auftragsnummer
 from .writer import import_delivery, finalize_geopackage, pruefe_chronologische_reihenfolge, pruefe_verfahren, pruefe_bereits_importiert
-from .styling import style_layer
 from .beteiligung import berechne_beteiligtenstatus
-
-# Objektarten, die im Auswahldialog standardmaessig angehakt sind.
-# Einfach anpassen - Tabellennamen entsprechen den Objektarten aus der NAS-Datei
-# (z.B. AX_Flurstueck, AX_Gebaeude, AX_Grenzpunkt, ...).
-STANDARD_LAYER_AUSWAHL = {
-    "AX_Flurstueck",
-}
-
-
-def bereits_geladene_tabellen(gpkg_pfad):
-    """Tabellennamen aus diesem GeoPackage, die schon als Layer im Projekt
-    liegen. Erkannt ueber Dateipfad + Tabellenname der Layer-Quelle, nicht
-    ueber den Layernamen - so wird auch ein umbenannter Layer erkannt."""
-    ziel = os.path.normcase(os.path.abspath(gpkg_pfad))
-    gefunden = set()
-    for layer in QgsProject.instance().mapLayers().values():
-        if not isinstance(layer, QgsVectorLayer) or layer.providerType() != "ogr":
-            continue
-        teile = layer.source().split("|")
-        if os.path.normcase(os.path.abspath(teile[0])) != ziel:
-            continue
-        for teil in teile[1:]:
-            if teil.startswith("layername="):
-                gefunden.add(teil[len("layername="):])
-    return gefunden
-
-
-class LayerAuswahlDialog(QDialog):
-    """Checkbox-Liste, um vor dem Laden auszuwaehlen, welche Objektart-Tabellen
-    tatsaechlich als Layer ins Projekt sollen.
-
-    vorausgewaehlt: Menge/Liste von Tabellennamen, die beim Oeffnen bereits
-    angehakt sein sollen. Ohne Angabe (None) werden alle angehakt.
-
-    bereits_geladen: Tabellennamen, die schon im Projekt liegen - sie werden
-    ausgegraut und abgehakt angezeigt ("bereits geladen") und nie erneut
-    geladen."""
-
-    def __init__(self, tabellen, vorausgewaehlt=None, bereits_geladen=None, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Layer auswaehlen")
-        self.setMinimumSize(340, 440)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Welche Objektarten sollen geladen werden?"))
-
-        self.liste = QListWidget()
-        bereits_geladen = bereits_geladen or set()
-        for tabelle in tabellen:
-            if tabelle in bereits_geladen:
-                item = QListWidgetItem(f"{tabelle}  (bereits geladen)")
-                item.setData(Qt.UserRole, tabelle)
-                item.setFlags(Qt.NoItemFlags)  # ausgegraut, nicht bedienbar
-                item.setCheckState(Qt.Checked)
-            else:
-                item = QListWidgetItem(tabelle)
-                item.setData(Qt.UserRole, tabelle)
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                angehakt = True if vorausgewaehlt is None else tabelle in vorausgewaehlt
-                item.setCheckState(Qt.Checked if angehakt else Qt.Unchecked)
-            self.liste.addItem(item)
-        layout.addWidget(self.liste)
-
-        auswahl_row = QHBoxLayout()
-        alle_button = QPushButton("Alle")
-        alle_button.clicked.connect(lambda: self._alle_setzen(Qt.Checked))
-        keine_button = QPushButton("Keine")
-        keine_button.clicked.connect(lambda: self._alle_setzen(Qt.Unchecked))
-        auswahl_row.addWidget(alle_button)
-        auswahl_row.addWidget(keine_button)
-        layout.addLayout(auswahl_row)
-
-        button_row = QHBoxLayout()
-        ok_button = QPushButton("Laden")
-        # Leicht gruen, damit der Button sich von Alle/Keine/Abbrechen abhebt
-        ok_button.setStyleSheet(
-            "QPushButton { background-color: #c8e6c9; border: 1px solid #81c784; "
-            "border-radius: 3px; padding: 4px 12px; font-weight: bold; }"
-            "QPushButton:hover { background-color: #a5d6a7; }"
-            "QPushButton:pressed { background-color: #81c784; }"
-        )
-        ok_button.setDefault(True)
-        ok_button.clicked.connect(self.accept)
-        cancel_button = QPushButton("Abbrechen")
-        cancel_button.clicked.connect(self.reject)
-        button_row.addWidget(ok_button)
-        button_row.addWidget(cancel_button)
-        layout.addLayout(button_row)
-
-    def _alle_setzen(self, state):
-        for i in range(self.liste.count()):
-            item = self.liste.item(i)
-            if item.flags() & Qt.ItemIsEnabled:  # bereits geladene bleiben unberuehrt
-                item.setCheckState(state)
-
-    def ausgewaehlte_tabellen(self):
-        return [
-            self.liste.item(i).data(Qt.UserRole)
-            for i in range(self.liste.count())
-            if (self.liste.item(i).flags() & Qt.ItemIsEnabled)
-            and self.liste.item(i).checkState() == Qt.Checked
-        ]
-
 
 class ImportTab(QWidget):
     def __init__(self, plugin, parent=None):
@@ -172,14 +73,19 @@ class ImportTab(QWidget):
         self.start_button.clicked.connect(self.import_starten)
         layout.addWidget(self.start_button)
 
-        laden_button = QPushButton("4. GeoPackage in QGIS laden")
-        laden_button.clicked.connect(self.gpkg_laden)
-        layout.addWidget(laden_button)
-
         layout.addWidget(QLabel("Protokoll:"))
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         layout.addWidget(self.log)
+
+    def gpkg_aktualisieren(self):
+        """Uebernimmt ein zwischenzeitlich im Vergleich-Reiter gewaehltes
+        GeoPackage (plugin.letztes_gpkg), damit beide Reiter auf dieselbe
+        Datei zeigen."""
+        if self.plugin.letztes_gpkg and self.plugin.letztes_gpkg != self.gpkg_pfad:
+            self.gpkg_pfad = self.plugin.letztes_gpkg
+            self.gpkg_label.setText(self.gpkg_pfad)
+            self._bereits_eingelesen_aktualisieren()
 
     def gpkg_waehlen(self):
         pfad, _ = QFileDialog.getSaveFileName(
@@ -342,53 +248,3 @@ class ImportTab(QWidget):
                 QMessageBox.information(self, "Import abgeschlossen", "Alle Dateien wurden eingespielt.")
         finally:
             self.start_button.setEnabled(True)
-
-    def gpkg_laden(self):
-        if not self.gpkg_pfad or not os.path.exists(self.gpkg_pfad):
-            QMessageBox.warning(self, "Fehler", "Kein gueltiges GeoPackage gewaehlt bzw. noch nicht erzeugt.")
-            return
-        import sqlite3
-        conn = sqlite3.connect(self.gpkg_pfad)
-        tabellen = [r[0] for r in conn.execute(
-            "SELECT table_name FROM gpkg_contents WHERE data_type='features' ORDER BY table_name"
-        )]
-        conn.close()
-
-        if not tabellen:
-            QMessageBox.information(self, "Keine Layer", "Keine Objektart-Tabellen mit Geometrie gefunden.")
-            return
-
-        schon_geladen = bereits_geladene_tabellen(self.gpkg_pfad)
-        auswahl_dialog = LayerAuswahlDialog(
-            tabellen, vorausgewaehlt=STANDARD_LAYER_AUSWAHL,
-            bereits_geladen=schon_geladen, parent=self,
-        )
-        if auswahl_dialog.exec_() != QDialog.Accepted:
-            return
-        # Sicherheitsnetz: bereits geladene Tabellen nie erneut laden, auch wenn
-        # sich zwischen Oeffnen und Bestaetigen des Fensters etwas geaendert hat
-        ausgewaehlt = [t for t in auswahl_dialog.ausgewaehlte_tabellen() if t not in bereits_geladene_tabellen(self.gpkg_pfad)]
-        uebersprungen = sorted(schon_geladen & set(tabellen))
-        if uebersprungen:
-            self._log(f"\nBereits geladen (übersprungen): {', '.join(uebersprungen)}")
-
-        geladen = 0
-        erste_gueltige_crs = None
-        for index, tabelle in enumerate(ausgewaehlt):
-            layer = QgsVectorLayer(f"{self.gpkg_pfad}|layername={tabelle}", tabelle, "ogr")
-            if layer.isValid():
-                style_layer(layer, tabelle, index)
-                QgsProject.instance().addMapLayer(layer)
-                if erste_gueltige_crs is None and layer.crs().isValid():
-                    erste_gueltige_crs = layer.crs()
-                geladen += 1
-        self._log(f"\n{geladen} von {len(tabellen)} verfuegbaren Layern ins Projekt geladen.")
-
-        if erste_gueltige_crs is not None:
-            projekt_crs = QgsProject.instance().crs()
-            if projekt_crs != erste_gueltige_crs:
-                QgsProject.instance().setCrs(erste_gueltige_crs)
-                self._log(
-                    f"Projekt-CRS auf {erste_gueltige_crs.authid()} gesetzt "
-                    f"(vorher: {projekt_crs.authid() or 'nicht gesetzt'})."
-                )

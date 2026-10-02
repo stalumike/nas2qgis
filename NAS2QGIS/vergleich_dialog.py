@@ -1,3 +1,14 @@
+"""
+Vergleich-Reiter: vergleicht zwei Staende einer Objektart aus der
+SCD2-Historie eines NAS-GeoPackages.
+
+Quelle ist das GeoPackage selbst (Datei + Objektart-Tabelle), NICHT ein ins
+Projekt geladener Layer: die Tabelle wird intern geoeffnet. Sichtbar werden
+nur die daraus gebildeten Memory-Layer (Zustand A/B, Unterschiede,
+Attributaenderungen).
+"""
+
+import os
 import sqlite3
 
 from .styling import style_diff_layer, style_layer
@@ -6,6 +17,7 @@ from qgis.PyQt import sip
 from qgis.PyQt.QtCore import Qt, QVariant
 from qgis.PyQt.QtWidgets import (
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -24,7 +36,51 @@ from qgis.core import (
 )
 
 
-NAME_ROLLE = Qt.UserRole + 1  # Layername ohne Status-Zusatz (das Dropdown zeigt ihn mit)
+NAME_ROLLE = Qt.UserRole + 1  # Tabellenname ohne Status-Zusatz (das Dropdown zeigt ihn mit)
+
+
+def _pfad_normiert(pfad):
+    return os.path.normcase(os.path.abspath(pfad)) if pfad else None
+
+
+def nas_tabellen(gpkg_path):
+    """Objektart-Tabellen mit Geometrie und Historisierung (gueltig_von)."""
+    if not gpkg_path or not os.path.exists(gpkg_path):
+        return []
+    conn = sqlite3.connect(gpkg_path)
+    try:
+        kandidaten = [r[0] for r in conn.execute(
+            "SELECT table_name FROM gpkg_contents WHERE data_type='features' ORDER BY table_name"
+        )]
+        tabellen = []
+        for tabelle in kandidaten:
+            spalten = {r[1] for r in conn.execute(f'PRAGMA table_info("{tabelle}")')}
+            if "gueltig_von" in spalten:
+                tabellen.append(tabelle)
+    except sqlite3.OperationalError:
+        tabellen = []
+    finally:
+        conn.close()
+    return tabellen
+
+
+def oeffne_nas_tabelle(gpkg_path, tabelle):
+    """Oeffnet eine Objektart-Tabelle intern (NICHT ins Projekt geladen),
+    ungefiltert mit allen Objektversionen. Layername = Tabellenname, damit
+    er ueberall als Schluessel der Objektart dient. None, falls unlesbar."""
+    layer = QgsVectorLayer(f"{gpkg_path}|layername={tabelle}", tabelle, "ogr")
+    if not layer.isValid() or layer.fields().indexOf("gueltig_von") < 0:
+        return None
+    return layer
+
+
+def projekt_crs_sicherstellen(crs):
+    """Ersatz fuer das fruehere Setzen beim Laden der GeoPackage-Layer: In
+    einem leeren Projekt das KBS der NAS-Daten uebernehmen, damit die
+    Ergebnis-Layer nicht in einem zufaelligen Standard-KBS landen."""
+    projekt = QgsProject.instance()
+    if crs.isValid() and (not projekt.mapLayers() or not projekt.crs().isValid()):
+        projekt.setCrs(crs)
 
 
 def _datum_de(iso):
@@ -71,9 +127,22 @@ class VergleichTab(QWidget):
         self.plugin = plugin
         self.blink_controller = plugin.blink_controller
 
+        self.gpkg_pfad = None
+        self._quellen = {}  # Tabellenname -> intern geoeffneter Layer (fuer self.gpkg_pfad)
+
         layout = QVBoxLayout(self)
 
-        layout.addWidget(QLabel("Layer (aus dem NAS-GeoPackage):"))
+        layout.addWidget(QLabel("NAS-GeoPackage:"))
+        gpkg_row = QHBoxLayout()
+        self.gpkg_label = QLabel()
+        self.gpkg_label.setWordWrap(True)
+        gpkg_button = QPushButton("Auswählen...")
+        gpkg_button.clicked.connect(self._gpkg_waehlen)
+        gpkg_row.addWidget(self.gpkg_label, stretch=1)
+        gpkg_row.addWidget(gpkg_button)
+        layout.addLayout(gpkg_row)
+
+        layout.addWidget(QLabel("Objektart:"))
         self.layer_combo = QComboBox()
         layout.addWidget(self.layer_combo)
 
@@ -99,11 +168,10 @@ class VergleichTab(QWidget):
         wertklassen_button.clicked.connect(self._oeffne_wertklassen_dialog)
         layout.addWidget(wertklassen_button)
 
-        self.layer_combo.currentIndexChanged.connect(self.lieferungen_aktualisieren)
         self.layer_combo.currentIndexChanged.connect(self._attr_button_aktualisieren)
         self.run_button.clicked.connect(self.vergleichen)
 
-        self.layer_liste_befuellen()
+        self.quelle_aktualisieren()
         layout.addStretch()
 
     def _zeige_attributaenderungen(self):
@@ -135,7 +203,7 @@ class VergleichTab(QWidget):
         for i in range(self.layer_combo.count()):
             name = self.layer_combo.itemData(i, NAME_ROLLE)
             vergleich = self.plugin.vergleiche.get(name)
-            if vergleich is None:
+            if vergleich is None or _pfad_normiert(vergleich.get("gpkg_pfad")) != _pfad_normiert(self.gpkg_pfad):
                 self.layer_combo.setItemText(i, name)
             else:
                 a, b = vergleich["zeitraum"]
@@ -145,65 +213,91 @@ class VergleichTab(QWidget):
         from .wertklassen_dialog import oeffne_wertklassen_dialog
         self._wertklassen_dialog = oeffne_wertklassen_dialog(self.iface, self.plugin)
 
-    def layer_liste_befuellen(self):
+    def _gpkg_waehlen(self):
+        start_ordner = os.path.dirname(self.gpkg_pfad) if self.gpkg_pfad else ""
+        pfad, _ = QFileDialog.getOpenFileName(
+            self, "NAS-GeoPackage wählen", start_ordner, "GeoPackage (*.gpkg)"
+        )
+        if not pfad:
+            return
+        # Gilt auch fuer den Import-Reiter, damit beide auf dieselbe Datei zeigen
+        self.plugin.letztes_gpkg = pfad
+        self.quelle_aktualisieren()
+
+    def quelle_aktualisieren(self):
+        """Uebernimmt plugin.letztes_gpkg (gemeinsam mit dem Import-Reiter)
+        und liest Objektarten und Lieferungen neu ein. Wird beim Wechsel auf
+        diesen Reiter aufgerufen - so sind auch gerade erst importierte
+        Lieferungen/Objektarten sofort waehlbar."""
+        self.gpkg_pfad = self.plugin.letztes_gpkg
+        # Interne Layer neu oeffnen: nach einem Import koennen neue Spalten
+        # dazugekommen sein, die ein bereits geoeffneter Layer nicht kennt.
+        self._quellen = {}
+        self.gpkg_label.setText(self.gpkg_pfad or "(noch nicht gewählt)")
+
         vorher = self._layername_aus_dropdown()
         self.layer_combo.blockSignals(True)
         self.layer_combo.clear()
-        for layer in QgsProject.instance().mapLayers().values():
-            # providerType() == "ogr" schliesst unsere eigenen, bei einem
-            # vorherigen Vergleich erzeugten Memory-Layer (Zustand A/B,
-            # Unterschiede, Attributaenderungen) aus - die haben zwar auch
-            # ein 'gueltig_von'-Feld, aber keinen echten GeoPackage-Pfad.
-            if (isinstance(layer, QgsVectorLayer)
-                    and layer.providerType() == "ogr"
-                    and layer.fields().indexOf("gueltig_von") >= 0):
-                self.layer_combo.addItem(layer.name(), layer)
-                self.layer_combo.setItemData(self.layer_combo.count() - 1, layer.name(), NAME_ROLLE)
+        for tabelle in nas_tabellen(self.gpkg_pfad):
+            self.layer_combo.addItem(tabelle)
+            self.layer_combo.setItemData(self.layer_combo.count() - 1, tabelle, NAME_ROLLE)
         self._dropdown_texte_aktualisieren()
-        # Bisherige Auswahl beibehalten (der Reiterwechsel fuellt die Liste
-        # jedes Mal neu - ohne das sprang die Auswahl immer auf den ersten Eintrag)
-        if vorher is not None:
-            idx = self.layer_combo.findData(vorher, NAME_ROLLE)
+        # Bisherige Auswahl beibehalten, sonst AX_Flurstueck vorwaehlen
+        for gewuenscht in (vorher, "AX_Flurstueck"):
+            idx = self.layer_combo.findData(gewuenscht, NAME_ROLLE) if gewuenscht else -1
             if idx >= 0:
                 self.layer_combo.setCurrentIndex(idx)
+                break
         self.layer_combo.blockSignals(False)
-        # Kein Popup hier (mehr): dieser Tab wird beim Oeffnen des
-        # Hauptdialogs immer sofort erzeugt, auch wenn der Nutzer nur den
-        # Import-Reiter sehen will - ein Meldungsfenster wuerde da unpassend
-        # aufpoppen. Ein leeres Dropdown genuegt als stiller Hinweis; beim
-        # Klick auf "Vergleichen" kommt ohnehin eine Meldung, falls kein
-        # Layer gewaehlt ist.
+        # Kein Popup bei leerem Dropdown: dieser Reiter wird beim Oeffnen des
+        # Hauptdialogs sofort aufgebaut, auch wenn der Nutzer nur importieren
+        # will. Beim Klick auf "Vergleichen" kommt ggf. eine Meldung.
         self.lieferungen_aktualisieren()
         self._attr_button_aktualisieren()
 
     def aktueller_layer(self):
-        return self.layer_combo.currentData()
+        """Intern geoeffnete Tabelle der gewaehlten Objektart (oder None)."""
+        tabelle = self._layername_aus_dropdown()
+        if tabelle is None or not self.gpkg_pfad:
+            return None
+        layer = self._quellen.get(tabelle)
+        if layer is None:
+            layer = oeffne_nas_tabelle(self.gpkg_pfad, tabelle)
+            if layer is not None:
+                self._quellen[tabelle] = layer
+        return layer
 
     def lieferungen_aktualisieren(self):
         self.lieferung_a_combo.clear()
         self.lieferung_b_combo.clear()
-        layer = self.aktueller_layer()
-        if layer is None:
+        if not self.gpkg_pfad or not os.path.exists(self.gpkg_pfad):
             return
-        gpkg_path = _gpkg_path_from_layer(layer)
-        lieferungen = _lieferungen_lesen(gpkg_path)
-        if not lieferungen:
-            QMessageBox.warning(
-                self, "Keine Lieferungen gefunden",
-                "In diesem GeoPackage wurde keine 'nas_lieferungen'-Tabelle gefunden."
-            )
-            return
+        lieferungen = _lieferungen_lesen(self.gpkg_pfad)
         for dateiname, abgabe_ende in lieferungen:
             label = f"{abgabe_ende}  ({dateiname})"
             self.lieferung_a_combo.addItem(label, abgabe_ende)
             self.lieferung_b_combo.addItem(label, abgabe_ende)
-        self.lieferung_a_combo.setCurrentIndex(0)
-        self.lieferung_b_combo.setCurrentIndex(self.lieferung_b_combo.count() - 1)
+        if lieferungen:
+            self.lieferung_a_combo.setCurrentIndex(0)
+            self.lieferung_b_combo.setCurrentIndex(self.lieferung_b_combo.count() - 1)
 
     def vergleichen(self):
+        if not self.gpkg_pfad or not os.path.exists(self.gpkg_pfad):
+            QMessageBox.warning(self, "Fehler", "Bitte zuerst ein NAS-GeoPackage wählen.")
+            return
+        if self.layer_combo.count() == 0:
+            QMessageBox.warning(
+                self, "Fehler", "Das GeoPackage enthält keine historisierten Objektart-Tabellen."
+            )
+            return
         layer = self.aktueller_layer()
         if layer is None:
-            QMessageBox.warning(self, "Fehler", "Kein Layer ausgewaehlt.")
+            QMessageBox.warning(self, "Fehler", "Die gewählte Objektart konnte nicht geöffnet werden.")
+            return
+        if self.lieferung_a_combo.count() < 2:
+            QMessageBox.warning(
+                self, "Fehler", "Für einen Vergleich werden mindestens zwei Lieferungen benötigt."
+            )
             return
         iso_a = self.lieferung_a_combo.currentData()
         iso_b = self.lieferung_b_combo.currentData()
@@ -344,6 +438,7 @@ class VergleichTab(QWidget):
                 if alter_layer is not None and not sip.isdeleted(alter_layer):
                     QgsProject.instance().removeMapLayer(alter_layer.id())
 
+        projekt_crs_sicherstellen(layer.crs())
         for l in (layer_a, layer_b, layer_diff, layer_attr):
             if hasattr(l, "updateExtents"):
                 l.updateExtents()
