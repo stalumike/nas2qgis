@@ -7,6 +7,11 @@ Versionierung nach [Semantic Versioning](https://semver.org/lang/de/).
 
 ---
 ## [unrelesead]
+## [2.0.0] 2026-10-02
+### Changed
+- Bei der Ermittlung der potentiell anzupassenden Wertklassenflächen werden diese jetzt mit den Vergleichzeitpunkten der Flurstücke verschnitten, es werden Abschnitte gebildet und diese Abschnitte werden verglichen
+### Fix
+- Es wird jetzt zum Vergleich kein Layer mehr ins Projekt geladen, stattdessen erfolgt die Auswahl der zu vergleichenden Objekte aus den vorhandnen Objekten im Geopackage, der Vergleich erzeugt nur die Layer zu den Vergleichszeitpunkten s. #3
 ## [1.0.1] 2026-09-29
 ### Added
 - Prüfungen zum Einspielen der NBA Daten ergänzt:
