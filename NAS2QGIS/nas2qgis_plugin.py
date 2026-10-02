@@ -9,9 +9,10 @@ PLUGIN_DIR = os.path.dirname(__file__)
 class Nas2QgisPlugin:
     """Registriert eine einzelne Schaltflaeche/Menuepunkt 'NAS2QGIS
     öffnen...' unter Erweiterungen -> NAS2QGIS, die den Hauptdialog mit den
-    Reitern 'Import' und 'Vergleich' oeffnet. Die Wertklassenflaechen-
-    Ermittlung ist kein eigener Einstiegspunkt mehr, sondern ein Button im
-    Vergleich-Reiter (siehe vergleich_dialog.py)."""
+    Reitern 'Import' und 'Vergleich' oeffnet. Der Wertklassen-
+    Abschnittsvergleich ist kein eigener Einstiegspunkt, sondern ein Button
+    im Vergleich-Reiter (siehe vergleich_dialog.py) - er setzt aber keinen
+    vorherigen Vergleich voraus."""
 
     def __init__(self, iface):
         self.iface = iface
@@ -28,6 +29,12 @@ class Nas2QgisPlugin:
         # Vergleich derselben Objektart ersetzt nur den Eintrag dieser Objektart.
         self.vergleiche = {}
         self._attr_dialog_objektart = None
+        # Letzte Wertklassen-Abschnittsanalyse (siehe wertklassen_dialog.py):
+        # {"gpkg_pfad","zeitraum","crs","rohdaten","anzahl_flurstuecke","layer"}.
+        # Rohdaten sind ungefiltert - Filteraenderungen und erneutes Oeffnen
+        # des Fensters brauchen daher keine neue Verschneidung.
+        self.wertklassen_analyse = None
+        self._wertklassen_dialog = None
 
     def zeige_attributaenderungen(self, objektart, neu_aufbauen=False):
         """Oeffnet das Attributaenderungen-Fenster fuer den letzten Vergleich
