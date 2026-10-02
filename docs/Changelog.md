@@ -7,6 +7,8 @@ Versionierung nach [Semantic Versioning](https://semver.org/lang/de/).
 
 ---
 ## [unrelesead]
+## [2.1.0] 2026-10-02
+- es wurde ein Fehler behoben der dafür sorgte das untergangene Flurstücke noch als aktiv geführt wurden weil bei einem Replace ein wfs update ignoeriert wurde, jetzt wird bei einem Replace auch ein Update ausgewertet s. #5
 ## [2.0.0] 2026-10-02
 ### Changed
 - Bei der Ermittlung der potentiell anzupassenden Wertklassenflächen werden diese jetzt mit den Vergleichzeitpunkten der Flurstücke verschnitten, es werden Abschnitte gebildet und diese Abschnitte werden verglichen

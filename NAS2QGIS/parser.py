@@ -4,7 +4,10 @@ Prototyp-Parser fuer NAS/ALKIS-Aenderungsdateien (GID 7.1 / GeoInfoDok).
 Liest eine NAS-XML-Datei (Erst- oder Differenzabgabe, verpackt als
 AX_NutzerbezogeneBestandsdatenaktualisierung_NBA mit wfs:Transaction)
 und liefert je Objekt einen NASFeature-Datensatz mit:
-  - action:      "insert" | "replace" | "delete"
+  - action:      "insert" | "replace" | "delete" | "update"
+                 ("update" = wfs:Update; in NBA-Lieferungen i.d.R. das Setzen
+                 von lebenszeitintervall/endet, also der Untergang eines
+                 Objekts mit Erhalt der Historie - siehe parse_nas_file)
   - objektart:   z.B. "AX_Flurstueck"
   - oid:         stabile ADV-OID (ohne "urn:adv:oid:"-Praefix)
   - gml_id:      technische gml:id (kann bei Replace einen Zeitstempel-Suffix haben!)
@@ -353,6 +356,54 @@ def strip_oid_prefix(value):
     return value
 
 
+AAA_OID_LAENGE = 16
+
+
+def oid_aus_rid(rid):
+    """fes:ResourceId/@rid -> OID. Der rid kann neben der 16-stelligen
+    AAA-OID einen ebenfalls 16-stelligen Zeitstempel tragen
+    (z.B. 'DEMVAL71000uGnkw20260624T073422Z') - der wuerde sonst den
+    Abgleich mit der gespeicherten OID verhindern."""
+    rid = strip_oid_prefix(rid)
+    if rid and len(rid) > AAA_OID_LAENGE:
+        return rid[:AAA_OID_LAENGE]
+    return rid
+
+
+def _parse_update(action_elem):
+    """wfs:Update -> NASFeature je ResourceId. 'endet' wird befuellt, wenn
+    das Update lebenszeitintervall/.../endet setzt (Untergang des Objekts).
+    Alle uebrigen geaenderten Eigenschaften landen als ValueReference ->
+    Wert in 'attributes' - sie werden vom Writer NICHT angewendet, aber
+    gezaehlt, damit nichts unbemerkt verloren geht."""
+    objektart = (action_elem.get("typeName") or "").split(":")[-1] or None
+    endet = None
+    sonstige = {}
+    for prop in action_elem.findall(q(WFS_NS, "Property")):
+        ref_elem = prop.find(q(WFS_NS, "ValueReference"))
+        val_elem = prop.find(q(WFS_NS, "Value"))
+        referenz = (ref_elem.text or "").strip() if ref_elem is not None else ""
+        wert = (val_elem.text or "").strip() if val_elem is not None and val_elem.text else None
+        if referenz.split("/")[-1].split(":")[-1] == "endet":
+            endet = wert
+        else:
+            sonstige[referenz] = wert
+
+    filter_elem = action_elem.find(q(FES_NS, "Filter"))
+    rids = []
+    if filter_elem is not None:
+        rids = [r.get("rid") for r in filter_elem.iter(q(FES_NS, "ResourceId")) if r.get("rid")]
+    for rid in rids:
+        yield NASFeature(
+            action="update",
+            objektart=objektart,
+            oid=oid_aus_rid(rid),
+            gml_id=rid,
+            endet=endet,
+            attributes=dict(sonstige),
+        )
+
+
 def build_punktort_geometries(root, curve_lookup):
     """
     Manche Fachobjekte (z.B. AX_Grenzpunkt, AX_BesondererGebaeudepunkt) tragen
@@ -382,7 +433,7 @@ def build_punktort_geometries(root, curve_lookup):
 
 
 def parse_nas_file(path):
-    """Generator: liefert NASFeature-Objekte fuer alle Insert/Replace/Delete-Aktionen."""
+    """Generator: liefert NASFeature-Objekte fuer alle Insert/Replace/Delete/Update-Aktionen."""
     tree = etree.parse(path)
     root = tree.getroot()
     curve_lookup = index_curves(root)
@@ -390,10 +441,14 @@ def parse_nas_file(path):
 
     for action_elem in root.iter():
         tag = local(action_elem.tag)
-        if tag not in ("Insert", "Replace", "Delete"):
+        if tag not in ("Insert", "Replace", "Delete", "Update"):
             continue
         # nur direkte wfs:Transaction-Kinder betrachten, nicht z.B. verschachtelte Treffer
         if action_elem.tag != q(WFS_NS, tag):
+            continue
+
+        if tag == "Update":
+            yield from _parse_update(action_elem)
             continue
 
         action = tag.lower()
@@ -408,7 +463,7 @@ def parse_nas_file(path):
         if filter_elem is not None:
             rid_elem = filter_elem.find(q(FES_NS, "ResourceId"))
             if rid_elem is not None:
-                filter_oid = rid_elem.get("rid")
+                filter_oid = oid_aus_rid(rid_elem.get("rid"))
 
         if object_elem is not None:
             objektart = local(object_elem.tag)
@@ -422,8 +477,9 @@ def parse_nas_file(path):
             attributes = extract_attributes(object_elem)
             beginnt, endet = extract_lebenszeitintervall(object_elem)
         else:
-            # reines Delete: kein Objektkoerper, nur der Filter mit der OID
-            objektart = None
+            # reines Delete: kein Objektkoerper, nur der Filter mit der OID.
+            # Die Objektart steht (sofern geliefert) im typeName-Attribut.
+            objektart = (action_elem.get("typeName") or "").split(":")[-1] or None
             gml_id = None
             oid = filter_oid
             geometry_wkt = None

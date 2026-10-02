@@ -228,7 +228,22 @@ class ImportTab(QWidget):
                     self._log(f"FEHLER: {exc}")
                     QMessageBox.critical(self, "Fehler beim Import", str(exc))
                     return
-                self._log(f"  Insert: {counts['insert']}, Replace: {counts['replace']}, Delete: {counts['delete']}")
+                self._log(
+                    f"  Insert: {counts['insert']}, Replace: {counts['replace']}, "
+                    f"Delete: {counts['delete']}, Untergang (Update endet): {counts['untergang']}"
+                )
+                if counts["bereits_geschlossen"]:
+                    self._log(f"  Untergang bereits durch Replace abgedeckt: {counts['bereits_geschlossen']}")
+                if counts["nicht_gefunden"]:
+                    self._log(
+                        f"  HINWEIS: {counts['nicht_gefunden']} Delete/Update auf eine OID, die im "
+                        f"GeoPackage nicht vorkommt (z.B. Objekt außerhalb des bisherigen Bestands)."
+                    )
+                if counts["update_ignoriert"]:
+                    self._log(
+                        f"  HINWEIS: {counts['update_ignoriert']} Update(s) auf andere Eigenschaften "
+                        f"als 'endet' - nicht angewendet."
+                    )
 
             self._log("\n=== Finalisiere GeoPackage ===")
             finalize_geopackage(self.gpkg_pfad)

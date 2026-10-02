@@ -7,6 +7,10 @@ Kernidee (SCD2-Historisierung):
                (gueltig_bis = beginnt der neuen Version), danach neue offene Zeile
   - Delete  -> offene Zeile wird geschlossen (gueltig_bis = Lieferungsdatum),
                keine neue Zeile
+  - Update mit lebenszeitintervall/endet (Untergang mit Erhalt der Historie,
+               in NBA-Lieferungen der Normalfall statt eines Delete)
+            -> offene Zeile wird geschlossen (gueltig_bis = endet aus der
+               Lieferung), keine neue Zeile
 
 GeoPackage wird direkt ueber sqlite3 + manuell gebautem WKB/GPKG-Binaerformat
 geschrieben, damit das Skript ohne GDAL/Fiona/PyQGIS lauffaehig ist.
@@ -356,19 +360,75 @@ class GpkgWriter:
         self._close_open_row(table, feature.oid, feature.beginnt)
         self._insert_row(feature)
 
-    def apply_delete(self, feature, delivery_ende):
-        # Wir wissen bei einem reinen Delete nicht, zu welcher Objektart die OID
-        # gehoert (kein Objektkoerper mitgeliefert) - deshalb in allen bekannten
-        # Tabellen nach der offenen Zeile suchen und dort schliessen.
-        for table in list(self.table_columns.keys()):
-            cur = self.conn.execute(
-                f'SELECT 1 FROM "{table}" WHERE oid = ? AND gueltig_bis IS NULL', (feature.oid,)
+    def _objekttabellen(self, bevorzugt=None):
+        """Alle historisierten Objektart-Tabellen IM GEOPACKAGE (nicht nur
+        die in diesem Importlauf schon angefassten - table_columns startet
+        je Lieferung leer). Die Tabelle der gelieferten Objektart zuerst."""
+        tabellen = [
+            r[0] for r in self.conn.execute(
+                "SELECT table_name FROM gpkg_contents WHERE table_name != 'nas_lieferungen'"
             )
-            if cur.fetchone():
-                self._close_open_row(table, feature.oid, delivery_ende)
-                return
-        # OID in noch keiner bekannten Tabelle gefunden -> in Log vermerken
-        print(f"WARNUNG: Delete fuer unbekannte OID {feature.oid} - keine offene Zeile gefunden")
+        ]
+        ergebnis = []
+        for table in tabellen:
+            if table not in self.table_columns:
+                cur = self.conn.execute(f'PRAGMA table_info("{table}")')
+                self.table_columns[table] = {row[1] for row in cur.fetchall()}
+            if {"oid", "gueltig_bis"} <= self.table_columns[table]:
+                ergebnis.append(table)
+        if bevorzugt in ergebnis:
+            ergebnis.remove(bevorzugt)
+            ergebnis.insert(0, bevorzugt)
+        return ergebnis
+
+    def _offene_zeile(self, oid, objektart=None):
+        """(tabelle, fid, gueltig_von) der offenen Zeile dieser OID oder None."""
+        for table in self._objekttabellen(objektart):
+            row = self.conn.execute(
+                f'SELECT fid, gueltig_von FROM "{table}" WHERE oid = ? AND gueltig_bis IS NULL',
+                (oid,),
+            ).fetchone()
+            if row:
+                return table, row[0], row[1]
+        return None
+
+    def apply_delete(self, feature, delivery_ende):
+        """True = offene Zeile geschlossen, False = OID nicht gefunden."""
+        treffer = self._offene_zeile(feature.oid, feature.objektart)
+        if treffer is None:
+            return False
+        table, fid, _ = treffer
+        self.conn.execute(f'UPDATE "{table}" SET gueltig_bis = ? WHERE fid = ?', (delivery_ende, fid))
+        return True
+
+    def apply_update(self, feature):
+        """wfs:Update. Angewendet wird nur das Setzen von endet (Untergang).
+        Rueckgabe:
+          "untergang"           - offene Zeile mit gueltig_bis = endet geschlossen
+          "bereits_geschlossen" - die betroffene Version war schon geschlossen,
+                                  z.B. weil ein Replace derselben OID in dieser
+                                  Lieferung vorher verarbeitet wurde
+          "nicht_gefunden"      - OID in keiner Tabelle vorhanden
+          "ignoriert"           - Update ohne endet (andere Eigenschaften)
+        """
+        endet = feature.endet
+        if not endet:
+            return "ignoriert"
+        treffer = self._offene_zeile(feature.oid, feature.objektart)
+        if treffer is not None:
+            table, fid, gueltig_von = treffer
+            # Schutz: nur eine Version schliessen, die VOR dem Untergang
+            # begonnen hat. Beginnt die offene Version bei/nach endet, ist es
+            # bereits die NEUE Version eines Replace derselben Lieferung -
+            # die alte wurde dabei schon geschlossen.
+            if gueltig_von is None or gueltig_von < endet:
+                self.conn.execute(f'UPDATE "{table}" SET gueltig_bis = ? WHERE fid = ?', (endet, fid))
+                return "untergang"
+            return "bereits_geschlossen"
+        for table in self._objekttabellen(feature.objektart):
+            if self.conn.execute(f'SELECT 1 FROM "{table}" WHERE oid = ? LIMIT 1', (feature.oid,)).fetchone():
+                return "bereits_geschlossen"
+        return "nicht_gefunden"
 
     def _compute_and_store_extents(self):
         """Berechnet min/max x/y je Geometrietabelle aus den WKB-Blobs und
@@ -598,15 +658,27 @@ def import_delivery(gpkg_path, nas_path, srs_id=None):
 
     writer = GpkgWriter(gpkg_path, srs_id=srs_id)
 
-    counts = {"insert": 0, "replace": 0, "delete": 0}
+    counts = {
+        "insert": 0, "replace": 0, "delete": 0,
+        "untergang": 0,              # Update mit endet -> Objekt beendet
+        "bereits_geschlossen": 0,    # Update endet, Version war schon geschlossen
+        "update_ignoriert": 0,       # Update auf andere Eigenschaften (nicht angewendet)
+        "nicht_gefunden": 0,         # Delete/Update auf unbekannte OID
+    }
     for feature in parse_nas_file(nas_path):
         if feature.action == "insert":
             writer.apply_insert(feature)
+            counts["insert"] += 1
         elif feature.action == "replace":
             writer.apply_replace(feature)
+            counts["replace"] += 1
         elif feature.action == "delete":
-            writer.apply_delete(feature, meta.get("abgabeintervallEnde"))
-        counts[feature.action] += 1
+            counts["delete"] += 1
+            if not writer.apply_delete(feature, meta.get("abgabeintervallEnde")):
+                counts["nicht_gefunden"] += 1
+        elif feature.action == "update":
+            ergebnis = writer.apply_update(feature)
+            counts["update_ignoriert" if ergebnis == "ignoriert" else ergebnis] += 1
 
     writer.conn.execute(
         "INSERT INTO nas_lieferungen (dateiname, antragsnummer, auftragsnummer, abgabeintervallBeginn, abgabeintervallEnde) "
