@@ -1,8 +1,9 @@
-"""Vorab-Stilisierung fuer frisch geladene NAS-Layer.
+"""Stile fuer die Ergebnis-Layer des Plugins.
 
-Ohne das wuerde QGIS jedem Layer eine zufaellige (meist deckende)
-Fuellfarbe geben - bei vielen gleichzeitig geladenen Objektarten
-verdeckt das schnell alles. Stattdessen: Flaechen nur als Kontur,
+style_layer() faerbt die Zustands-Layer A/B eines Vergleichs ein (die
+NAS-Tabellen selbst werden nicht mehr ins Projekt geladen). Ohne das wuerde
+QGIS jedem Layer eine zufaellige (meist deckende) Fuellfarbe geben - zwei
+deckungsgleiche Zustands-Layer verdecken sich dann gegenseitig. Stattdessen: Flaechen nur als Kontur,
 duenne Linien, kleine Punktsymbole.
 
 Farbe/Staerke lassen sich pro Objektart fest vorgeben (LAYER_STILE).
@@ -44,6 +45,7 @@ STANDARD_PUNKTGROESSE = 2.0   # mm, fuer Punktobjekte
 LAYER_STILE = {
     "AX_Flurstueck": {"farbe": "35,35,35", "breite": 0.6},
     "AX_Gebaeude": {"farbe": "227,26,28", "breite": 0.8},
+    "AX_BauRaumOderBodenordnungsrecht": {"farbe": "156,39,176", "breite": 1.2},
     # weitere Objektarten hier ergaenzen, z.B.:
     # "AX_Grenzpunkt": {"farbe": "0,0,0", "breite": 1.5},
 }
@@ -62,7 +64,8 @@ def _mit_alpha(farbe):
 
 
 def _stil_ermitteln(tabellenname, index):
-    vorgabe = LAYER_STILE.get(tabellenname, {})
+    # Gross-/Kleinschreibung ignorieren - die Tabellennamen kommen 1:1 aus der NAS
+    vorgabe = next((v for k, v in LAYER_STILE.items() if k.lower() == tabellenname.lower()), {})
     farbe = _mit_alpha(vorgabe["farbe"]) if "farbe" in vorgabe else farbe_fuer_index(index)
     breite = vorgabe.get("breite", STANDARD_LINIENBREITE)
     groesse = vorgabe.get("groesse", STANDARD_PUNKTGROESSE)
