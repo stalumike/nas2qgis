@@ -34,7 +34,6 @@ from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QApplication,
     QCheckBox,
-    QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
@@ -65,6 +64,7 @@ from qgis.core import (
 )
 
 from .styling import ABSCHNITT_KATEGORIEN, style_abschnitt_layer
+from .zeitpunkt_auswahl import ZeitpunktAuswahl
 from .vergleich_dialog import (
     _datum_de,
     _lieferungen_lesen,
@@ -414,14 +414,17 @@ class WertklassenDialog(QDialog):
         gpkg_button.clicked.connect(self._gpkg_waehlen)
         gpkg_row.addWidget(self.gpkg_label, stretch=1)
         gpkg_row.addWidget(gpkg_button)
-        self.zeitpunkt_a_combo = QComboBox()
-        self.zeitpunkt_b_combo = QComboBox()
+        self.zeitpunkte = ZeitpunktAuswahl()
         form.addRow("NAS-GeoPackage:", gpkg_row)
-        form.addRow("Zeitpunkt A (älterer Stand):", self.zeitpunkt_a_combo)
-        form.addRow("Zeitpunkt B (neuerer Stand):", self.zeitpunkt_b_combo)
+        form.addRow(self.zeitpunkte)
         self.berechnen_button = QPushButton("Abschnitte berechnen")
+        self.berechnen_button.setEnabled(False)
         self.berechnen_button.clicked.connect(self._berechnen)
         form.addRow(self.berechnen_button)
+        # Berechnen nur bei sinnvoller Auswahl (A aelter als B)
+        self.zeitpunkte.gueltigkeit_geaendert.connect(
+            lambda gueltig: self.berechnen_button.setEnabled(gueltig and self._flst_layer is not None)
+        )
         layout.addWidget(grundlage)
 
         # --- Filter ----------------------------------------------------------
@@ -472,9 +475,12 @@ class WertklassenDialog(QDialog):
         self._filter_timer.timeout.connect(self._filter_anwenden)
 
         self._schwellen_laden()
-        self.min_delta_spin.valueChanged.connect(self._filter_timer.start)
-        self.min_flaeche_spin.valueChanged.connect(self._filter_timer.start)
-        self.splitter_check.toggled.connect(self._filter_timer.start)
+        # Nicht direkt mit _filter_timer.start verbinden: das Signal liefert
+        # den neuen Wert mit, und start(wert) wuerde ihn als Wartezeit in ms
+        # deuten - die Entprellung waere damit ausgehebelt.
+        self.min_delta_spin.valueChanged.connect(lambda _wert: self._filter_timer.start())
+        self.min_flaeche_spin.valueChanged.connect(lambda _wert: self._filter_timer.start())
+        self.splitter_check.toggled.connect(lambda _an: self._filter_timer.start())
 
         # Gemeinsames GeoPackage mit Import-/Vergleich-Reiter; ein letztes
         # Ergebnis wird nur wiederhergestellt, wenn es zu dieser Datei gehoert.
@@ -501,9 +507,7 @@ class WertklassenDialog(QDialog):
         self.gpkg_pfad = pfad
         self.gpkg_label.setText(pfad or "(noch nicht gewählt)")
         self._flst_layer = None
-        self.zeitpunkt_a_combo.clear()
-        self.zeitpunkt_b_combo.clear()
-        self.berechnen_button.setEnabled(False)
+        self.zeitpunkte.setze_lieferungen([])
 
         if not pfad or not os.path.exists(pfad):
             self.info_label.setText("Bitte ein NAS-GeoPackage wählen.")
@@ -515,32 +519,16 @@ class WertklassenDialog(QDialog):
             )
             return
 
-        lieferungen = _lieferungen_lesen(pfad)
-        for dateiname, abgabe_ende in lieferungen:
-            label = f"{_datum_de(abgabe_ende)}  ({dateiname})"
-            self.zeitpunkt_a_combo.addItem(label, abgabe_ende)
-            self.zeitpunkt_b_combo.addItem(label, abgabe_ende)
-        if len(lieferungen) < 2:
-            self.info_label.setText(
-                "Für einen Abschnittsvergleich werden mindestens zwei eingespielte "
-                "Lieferungen benötigt."
-            )
-            return
-        # Vorauswahl: vorletzte und letzte Lieferung
-        self.zeitpunkt_a_combo.setCurrentIndex(len(lieferungen) - 2)
-        self.zeitpunkt_b_combo.setCurrentIndex(len(lieferungen) - 1)
-        self.berechnen_button.setEnabled(True)
+        # Vorauswahl: vorletzte und letzte Lieferung (Standard der Auswahl).
+        # Zu wenige Lieferungen meldet die Auswahl selbst.
         self.info_label.setText("")
+        self.zeitpunkte.setze_lieferungen(_lieferungen_lesen(pfad))
 
     def _gespeichertes_ergebnis_anzeigen(self):
         """Beim erneuten Oeffnen das letzte Ergebnis wiederherstellen - ohne
         neue Verschneidung."""
         analyse = self.plugin.wertklassen_analyse
-        iso_a, iso_b = analyse["zeitraum"]
-        for combo, iso in ((self.zeitpunkt_a_combo, iso_a), (self.zeitpunkt_b_combo, iso_b)):
-            idx = combo.findData(iso)
-            if idx >= 0:
-                combo.setCurrentIndex(idx)
+        self.zeitpunkte.setze_zeitpunkte(*analyse["zeitraum"])
         self._filter_anwenden()
 
     # ------------------------------------------------------------------
@@ -567,13 +555,10 @@ class WertklassenDialog(QDialog):
         layer = self._flst_layer
         if layer is None:
             return
-        iso_a = self.zeitpunkt_a_combo.currentData()
-        iso_b = self.zeitpunkt_b_combo.currentData()
-        if iso_a == iso_b:
-            QMessageBox.warning(self, "Fehler", "Zeitpunkt A und B sind identisch.")
+        # Button ist bei ungueltiger Auswahl ausgegraut - hier nur Absicherung
+        if not self.zeitpunkte.ist_gueltig():
             return
-        if iso_a > iso_b:
-            iso_a, iso_b = iso_b, iso_a
+        iso_a, iso_b = self.zeitpunkte.iso_a(), self.zeitpunkte.iso_b()
 
         gpkg_pfad = self.gpkg_pfad
         wk_layer = _beschaffe_wertklassen_layer(self, gpkg_pfad)

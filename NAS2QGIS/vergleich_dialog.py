@@ -17,6 +17,7 @@ import sqlite3
 
 from .parser import verfahrensnummer_aus_auftragsnummer
 from .styling import style_diff_layer, style_layer
+from .zeitpunkt_auswahl import ZeitpunktAuswahl
 
 from qgis.PyQt import sip
 from qgis.PyQt.QtCore import Qt, QVariant
@@ -114,33 +115,68 @@ def _brb_tabelle_finden(gpkg_path):
     return None
 
 
-def verfahrensgebiet_pruefen(gpkg_path):
-    """(filter, verfahrensnummern, grund, tabelle). filter ist None, wenn kein
-    aktuelles Verfahrensgebiet des eigenen Verfahrens enthalten ist - grund
-    erklaert dann, warum (fuer den Tooltip des ausgegrauten Buttons)."""
-    if not gpkg_path or not os.path.exists(gpkg_path):
-        return None, [], "Kein NAS-GeoPackage gewählt.", None
-    tabelle = _brb_tabelle_finden(gpkg_path)
-    if tabelle is None:
-        return None, [], f"Die Lieferungen enthalten keine Objektart {BRB_TABELLE}.", None
-    nummern = eigene_verfahrensnummern(gpkg_path)
-    if not nummern:
-        return None, [], "Die Verfahrensnummer konnte aus den Lieferungen nicht ermittelt werden.", tabelle
-
-    werte = ", ".join("'" + n.replace("'", "''") + "'" for n in nummern)
-    filter_ausdruck = f'{AKTUELL_FILTER} AND TRIM("{BRB_VERFAHRENSNUMMER_FELD}") IN ({werte})'
+def _anzahl(gpkg_path, tabelle, where):
     conn = sqlite3.connect(gpkg_path)
     try:
-        anzahl = conn.execute(f'SELECT COUNT(*) FROM "{tabelle}" WHERE {filter_ausdruck}').fetchone()[0]
+        return conn.execute(f'SELECT COUNT(*) FROM "{tabelle}" WHERE {where}').fetchone()[0]
     except sqlite3.OperationalError:
-        anzahl = 0  # z.B. Spalte bezeichnung fehlt
+        return 0  # z.B. Spalte bezeichnung fehlt
     finally:
         conn.close()
-    if anzahl == 0:
-        return None, nummern, (
-            f"Kein aktuelles Verfahrensgebiet für Verfahren {', '.join(nummern)} enthalten."
-        ), tabelle
-    return filter_ausdruck, nummern, None, tabelle
+
+
+def verfahrensgebiet_pruefen(gpkg_path):
+    """Liefert ein Dict mit:
+      filter   - Filterausdruck fuer den Layer, None = nichts zu laden
+      tabelle  - tatsaechlicher BRB-Tabellenname im GeoPackage
+      name     - Layername
+      tooltip  - Erklaerung fuer den Button (aktiv wie ausgegraut)
+
+    1. Verfahrensnummer aus der Auftragsnummer erkannt und ein aktuelles
+       BRB mit dieser bezeichnung vorhanden -> nur das eigene Verfahren.
+    2. Sonst (Auftragsnummer nicht im erwarteten Muster - jedes Katasteramt
+       traegt dort etwas anderes ein - oder keine passende bezeichnung)
+       -> Rueckfall: alle aktuellen BRB-Objekte. Die Lieferung ist nach den
+       Flurstuecken des Verfahrens zusammengestellt, das eigene
+       Verfahrensgebiet ist also auf jeden Fall dabei.
+    3. Kein aktuelles BRB-Objekt -> nichts zu laden (Button grau)."""
+    ergebnis = {"filter": None, "tabelle": None, "name": None, "tooltip": None}
+    if not gpkg_path or not os.path.exists(gpkg_path):
+        ergebnis["tooltip"] = "Kein NAS-GeoPackage gewählt."
+        return ergebnis
+    tabelle = _brb_tabelle_finden(gpkg_path)
+    if tabelle is None:
+        ergebnis["tooltip"] = f"Die Lieferungen enthalten keine Objektart {BRB_TABELLE}."
+        return ergebnis
+    ergebnis["tabelle"] = tabelle
+
+    nummern = eigene_verfahrensnummern(gpkg_path)
+    if nummern:
+        werte = ", ".join("'" + n.replace("'", "''") + "'" for n in nummern)
+        eigener_filter = f'{AKTUELL_FILTER} AND TRIM("{BRB_VERFAHRENSNUMMER_FELD}") IN ({werte})'
+        if _anzahl(gpkg_path, tabelle, eigener_filter):
+            nr_text = ", ".join(nummern)
+            ergebnis.update(
+                filter=eigener_filter,
+                name=f"Verfahrensgebiet {nr_text} (aktueller Stand)",
+                tooltip=f"Verfahrensgebiet {nr_text} (aktueller Stand) laden und darauf zoomen",
+            )
+            return ergebnis
+
+    if _anzahl(gpkg_path, tabelle, AKTUELL_FILTER) == 0:
+        ergebnis["tooltip"] = "Die Lieferungen enthalten kein aktuelles Verfahrensgebiet."
+        return ergebnis
+
+    grund = (
+        f"Kein Verfahrensgebiet mit der Nummer {', '.join(nummern)} gefunden"
+        if nummern else "Die Verfahrensnummer ist aus den Lieferungen nicht erkennbar"
+    )
+    ergebnis.update(
+        filter=AKTUELL_FILTER,
+        name="Verfahrensgebiete (aktueller Stand)",
+        tooltip=f"{grund} - es werden alle aktuellen Verfahrensgebiete geladen.",
+    )
+    return ergebnis
 
 
 def aktuellen_stand_laden(iface, gpkg_path, tabelle, filter_ausdruck=AKTUELL_FILTER, name=None, zoomen=False):
@@ -268,18 +304,16 @@ class VergleichTab(QWidget):
         objektart_row.addWidget(self.stand_button)
         layout.addLayout(objektart_row)
 
-        layout.addWidget(QLabel("Zeitpunkt A (aelterer Stand):"))
-        self.lieferung_a_combo = QComboBox()
-        layout.addWidget(self.lieferung_a_combo)
-
-        layout.addWidget(QLabel("Zeitpunkt B (neuerer Stand):"))
-        self.lieferung_b_combo = QComboBox()
-        layout.addWidget(self.lieferung_b_combo)
+        self.zeitpunkte = ZeitpunktAuswahl()
+        layout.addWidget(self.zeitpunkte)
 
         button_row = QHBoxLayout()
         self.run_button = QPushButton("Vergleichen")
+        self.run_button.setEnabled(False)
         button_row.addWidget(self.run_button)
         layout.addLayout(button_row)
+        # Vergleichen nur bei sinnvoller Auswahl (A aelter als B)
+        self.zeitpunkte.gueltigkeit_geaendert.connect(self.run_button.setEnabled)
 
         self.attr_button = QPushButton("Attributänderungen anzeigen")
         self.attr_button.setEnabled(False)
@@ -380,22 +414,16 @@ class VergleichTab(QWidget):
         self._verfahrensgebiet_button_aktualisieren()
 
     def _verfahrensgebiet_button_aktualisieren(self):
-        self._verfahrensgebiet_filter, nummern, grund, self._brb_tabelle = verfahrensgebiet_pruefen(self.gpkg_pfad)
-        self._verfahrensnummern = nummern
-        aktiv = self._verfahrensgebiet_filter is not None
-        self.verfahrensgebiet_button.setEnabled(aktiv)
-        self.verfahrensgebiet_button.setToolTip(
-            f"Verfahrensgebiet {', '.join(nummern)} (aktueller Stand) laden und darauf zoomen"
-            if aktiv else grund
-        )
+        self._verfahrensgebiet = verfahrensgebiet_pruefen(self.gpkg_pfad)
+        self.verfahrensgebiet_button.setEnabled(self._verfahrensgebiet["filter"] is not None)
+        self.verfahrensgebiet_button.setToolTip(self._verfahrensgebiet["tooltip"])
 
     def _verfahrensgebiet_anzeigen(self):
-        if not self._verfahrensgebiet_filter:
+        vg = self._verfahrensgebiet
+        if not vg["filter"]:
             return
         aktuellen_stand_laden(
-            self.iface, self.gpkg_pfad, self._brb_tabelle, self._verfahrensgebiet_filter,
-            name=f"Verfahrensgebiet {', '.join(self._verfahrensnummern)} (aktueller Stand)",
-            zoomen=True,
+            self.iface, self.gpkg_pfad, vg["tabelle"], vg["filter"], name=vg["name"], zoomen=True,
         )
 
     def _aktuellen_stand_anzeigen(self):
@@ -416,18 +444,17 @@ class VergleichTab(QWidget):
         return layer
 
     def lieferungen_aktualisieren(self):
-        self.lieferung_a_combo.clear()
-        self.lieferung_b_combo.clear()
+        """Liest die Lieferungen neu ein. Die bisherige Auswahl A/B bleibt
+        erhalten, wenn beide Zeitpunkte noch existieren (z.B. beim
+        Reiterwechsel mitten in einer Vergleichskette); sonst Vorauswahl
+        erste und letzte Lieferung (Gesamtaenderung)."""
+        vorher = (self.zeitpunkte.iso_a(), self.zeitpunkte.iso_b())
         if not self.gpkg_pfad or not os.path.exists(self.gpkg_pfad):
+            self.zeitpunkte.setze_lieferungen([])
             return
-        lieferungen = _lieferungen_lesen(self.gpkg_pfad)
-        for dateiname, abgabe_ende in lieferungen:
-            label = f"{abgabe_ende}  ({dateiname})"
-            self.lieferung_a_combo.addItem(label, abgabe_ende)
-            self.lieferung_b_combo.addItem(label, abgabe_ende)
-        if lieferungen:
-            self.lieferung_a_combo.setCurrentIndex(0)
-            self.lieferung_b_combo.setCurrentIndex(self.lieferung_b_combo.count() - 1)
+        self.zeitpunkte.setze_lieferungen(_lieferungen_lesen(self.gpkg_pfad), index_a=0, index_b=-1)
+        if vorher[0] and vorher[1]:
+            self.zeitpunkte.setze_zeitpunkte(*vorher)
 
     def vergleichen(self):
         if not self.gpkg_pfad or not os.path.exists(self.gpkg_pfad):
@@ -442,20 +469,11 @@ class VergleichTab(QWidget):
         if layer is None:
             QMessageBox.warning(self, "Fehler", "Die gewählte Objektart konnte nicht geöffnet werden.")
             return
-        if self.lieferung_a_combo.count() < 2:
-            QMessageBox.warning(
-                self, "Fehler", "Für einen Vergleich werden mindestens zwei Lieferungen benötigt."
-            )
+        # Der Button ist bei ungueltiger Auswahl ohnehin ausgegraut - die
+        # Pruefung hier ist nur die Absicherung.
+        if not self.zeitpunkte.ist_gueltig():
             return
-        iso_a = self.lieferung_a_combo.currentData()
-        iso_b = self.lieferung_b_combo.currentData()
-        if iso_a == iso_b:
-            QMessageBox.warning(self, "Fehler", "Zeitpunkt A und B sind identisch.")
-            return
-        if iso_a > iso_b:
-            iso_a, iso_b = iso_b, iso_a
-
-        self._fuehre_vergleich_aus(layer, iso_a, iso_b)
+        self._fuehre_vergleich_aus(layer, self.zeitpunkte.iso_a(), self.zeitpunkte.iso_b())
 
     def _fuehre_vergleich_aus(self, layer, iso_a, iso_b):
         quell_felder = layer.fields()

@@ -7,6 +7,8 @@ Versionierung nach [Semantic Versioning](https://semver.org/lang/de/).
 
 ---
 ## [unrelesead]
+- Schnellauswahl für Vergleichszeitpunkte ergänzt, es gibt jetzt Paar vor, Paar zurück, B=A+1 und A=B-1
+- Datumsangabe in anderem Format damit besser lesbar
 ## [2.1.1] 2026-10-13
 - im Reiter Vergleich gibt es jetzt die Schaltfläche Verfahrensgebiet anzeigen, dort wird ein Verfahrensgebiet (wenn in den eingelesenen NBA Daten vorhanden) mit aktuellstem Stand angezeigt
 - Im Reiter Vergleich gibt es die Funktion Aktuellen Stand anzeigen, aus der Klappliste Objektart lässt sich jetzt eine beliebige Objektart zur Ansicht in die Karte laden
