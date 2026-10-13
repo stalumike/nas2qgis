@@ -6,11 +6,16 @@ Quelle ist das GeoPackage selbst (Datei + Objektart-Tabelle), NICHT ein ins
 Projekt geladener Layer: die Tabelle wird intern geoeffnet. Sichtbar werden
 nur die daraus gebildeten Memory-Layer (Zustand A/B, Unterschiede,
 Attributaenderungen).
+
+Zusaetzlich kann der aktuelle Stand einer Objektart (bzw. das eigene
+Verfahrensgebiet) zur Orientierung als normaler, gefilterter Layer geladen
+werden - siehe aktuellen_stand_laden().
 """
 
 import os
 import sqlite3
 
+from .parser import verfahrensnummer_aus_auftragsnummer
 from .styling import style_diff_layer, style_layer
 
 from qgis.PyQt import sip
@@ -26,6 +31,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 from qgis.core import (
+    QgsCoordinateTransform,
     QgsFeature,
     QgsFeatureRequest,
     QgsField,
@@ -72,6 +78,110 @@ def oeffne_nas_tabelle(gpkg_path, tabelle):
     if not layer.isValid() or layer.fields().indexOf("gueltig_von") < 0:
         return None
     return layer
+
+
+# Offizielle ALKIS-Schreibweise; gesucht wird trotzdem unabhaengig von
+# Gross-/Kleinschreibung (siehe _brb_tabelle_finden).
+BRB_TABELLE = "AX_BauRaumOderBodenordnungsrecht"
+BRB_VERFAHRENSNUMMER_FELD = "bezeichnung"
+AKTUELL_FILTER = '"gueltig_bis" IS NULL'
+
+
+def eigene_verfahrensnummern(gpkg_path):
+    """Verfahrensnummer(n) aus den eingespielten Lieferungen (auftragsnummer,
+    Rueckfall antragsnummer - wie bei der Verfahrenspruefung im Import)."""
+    try:
+        conn = sqlite3.connect(gpkg_path)
+        try:
+            rows = conn.execute("SELECT antragsnummer, auftragsnummer FROM nas_lieferungen").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+    nummern = set()
+    for antragsnummer, auftragsnummer in rows:
+        nr = verfahrensnummer_aus_auftragsnummer(auftragsnummer) or verfahrensnummer_aus_auftragsnummer(antragsnummer)
+        if nr:
+            nummern.add(nr)
+    return sorted(nummern)
+
+
+def _brb_tabelle_finden(gpkg_path):
+    """Tatsaechlicher Tabellenname im GeoPackage (oder None)."""
+    for tabelle in nas_tabellen(gpkg_path):
+        if tabelle.lower() == BRB_TABELLE.lower():
+            return tabelle
+    return None
+
+
+def verfahrensgebiet_pruefen(gpkg_path):
+    """(filter, verfahrensnummern, grund, tabelle). filter ist None, wenn kein
+    aktuelles Verfahrensgebiet des eigenen Verfahrens enthalten ist - grund
+    erklaert dann, warum (fuer den Tooltip des ausgegrauten Buttons)."""
+    if not gpkg_path or not os.path.exists(gpkg_path):
+        return None, [], "Kein NAS-GeoPackage gewählt.", None
+    tabelle = _brb_tabelle_finden(gpkg_path)
+    if tabelle is None:
+        return None, [], f"Die Lieferungen enthalten keine Objektart {BRB_TABELLE}.", None
+    nummern = eigene_verfahrensnummern(gpkg_path)
+    if not nummern:
+        return None, [], "Die Verfahrensnummer konnte aus den Lieferungen nicht ermittelt werden.", tabelle
+
+    werte = ", ".join("'" + n.replace("'", "''") + "'" for n in nummern)
+    filter_ausdruck = f'{AKTUELL_FILTER} AND TRIM("{BRB_VERFAHRENSNUMMER_FELD}") IN ({werte})'
+    conn = sqlite3.connect(gpkg_path)
+    try:
+        anzahl = conn.execute(f'SELECT COUNT(*) FROM "{tabelle}" WHERE {filter_ausdruck}').fetchone()[0]
+    except sqlite3.OperationalError:
+        anzahl = 0  # z.B. Spalte bezeichnung fehlt
+    finally:
+        conn.close()
+    if anzahl == 0:
+        return None, nummern, (
+            f"Kein aktuelles Verfahrensgebiet für Verfahren {', '.join(nummern)} enthalten."
+        ), tabelle
+    return filter_ausdruck, nummern, None, tabelle
+
+
+def aktuellen_stand_laden(iface, gpkg_path, tabelle, filter_ausdruck=AKTUELL_FILTER, name=None, zoomen=False):
+    """Laedt eine Objektart als normalen GeoPackage-Layer, gefiltert auf den
+    aktuellen Stand. Der Filter ist dynamisch: nach einem spaeteren Import
+    zeigt der Layer automatisch den neuen Stand. Ist derselbe Layer schon im
+    Projekt, wird er nur ausgewaehlt (kein Duplikat)."""
+    name = name or f"{tabelle} (aktueller Stand)"
+    ziel = _pfad_normiert(gpkg_path)
+    for vorhanden in QgsProject.instance().mapLayers().values():
+        if not isinstance(vorhanden, QgsVectorLayer) or vorhanden.providerType() != "ogr":
+            continue
+        teile = vorhanden.source().split("|")
+        if (_pfad_normiert(teile[0]) == ziel and f"layername={tabelle}" in teile
+                and vorhanden.subsetString() == filter_ausdruck):
+            iface.setActiveLayer(vorhanden)
+            iface.messageBar().pushInfo("NAS2QGIS", f"'{vorhanden.name()}' ist bereits geladen.")
+            if zoomen:
+                _auf_layer_zoomen(iface, vorhanden)
+            return vorhanden
+
+    layer = QgsVectorLayer(f"{gpkg_path}|layername={tabelle}", name, "ogr")
+    if not layer.isValid() or not layer.setSubsetString(filter_ausdruck):
+        QMessageBox.warning(iface.mainWindow(), "Fehler", f"'{tabelle}' konnte nicht geladen werden.")
+        return None
+    style_layer(layer, tabelle)
+    projekt_crs_sicherstellen(layer.crs())
+    QgsProject.instance().addMapLayer(layer)
+    if zoomen:
+        _auf_layer_zoomen(iface, layer)
+    return layer
+
+
+def _auf_layer_zoomen(iface, layer):
+    canvas = iface.mapCanvas()
+    ausdehnung = layer.extent()
+    ziel_crs = canvas.mapSettings().destinationCrs()
+    if layer.crs().isValid() and layer.crs() != ziel_crs:
+        ausdehnung = QgsCoordinateTransform(layer.crs(), ziel_crs, QgsProject.instance()).transformBoundingBox(ausdehnung)
+    canvas.setExtent(ausdehnung.buffered(max(ausdehnung.width(), ausdehnung.height()) * 0.05))
+    canvas.refresh()
 
 
 def projekt_crs_sicherstellen(crs):
@@ -138,13 +248,25 @@ class VergleichTab(QWidget):
         self.gpkg_label.setWordWrap(True)
         gpkg_button = QPushButton("Auswählen...")
         gpkg_button.clicked.connect(self._gpkg_waehlen)
+        self.verfahrensgebiet_button = QPushButton("Verfahrensgebiet anzeigen")
+        self.verfahrensgebiet_button.clicked.connect(self._verfahrensgebiet_anzeigen)
         gpkg_row.addWidget(self.gpkg_label, stretch=1)
+        gpkg_row.addWidget(self.verfahrensgebiet_button)
         gpkg_row.addWidget(gpkg_button)
         layout.addLayout(gpkg_row)
 
         layout.addWidget(QLabel("Objektart:"))
+        objektart_row = QHBoxLayout()
         self.layer_combo = QComboBox()
-        layout.addWidget(self.layer_combo)
+        self.stand_button = QPushButton("Aktuellen Stand anzeigen")
+        self.stand_button.setToolTip(
+            "Lädt die gewählte Objektart mit ihrem aktuellen Stand (ohne historische "
+            "Versionen) in die Karte."
+        )
+        self.stand_button.clicked.connect(self._aktuellen_stand_anzeigen)
+        objektart_row.addWidget(self.layer_combo, stretch=1)
+        objektart_row.addWidget(self.stand_button)
+        layout.addLayout(objektart_row)
 
         layout.addWidget(QLabel("Zeitpunkt A (aelterer Stand):"))
         self.lieferung_a_combo = QComboBox()
@@ -254,6 +376,32 @@ class VergleichTab(QWidget):
         # will. Beim Klick auf "Vergleichen" kommt ggf. eine Meldung.
         self.lieferungen_aktualisieren()
         self._attr_button_aktualisieren()
+        self.stand_button.setEnabled(self.layer_combo.count() > 0)
+        self._verfahrensgebiet_button_aktualisieren()
+
+    def _verfahrensgebiet_button_aktualisieren(self):
+        self._verfahrensgebiet_filter, nummern, grund, self._brb_tabelle = verfahrensgebiet_pruefen(self.gpkg_pfad)
+        self._verfahrensnummern = nummern
+        aktiv = self._verfahrensgebiet_filter is not None
+        self.verfahrensgebiet_button.setEnabled(aktiv)
+        self.verfahrensgebiet_button.setToolTip(
+            f"Verfahrensgebiet {', '.join(nummern)} (aktueller Stand) laden und darauf zoomen"
+            if aktiv else grund
+        )
+
+    def _verfahrensgebiet_anzeigen(self):
+        if not self._verfahrensgebiet_filter:
+            return
+        aktuellen_stand_laden(
+            self.iface, self.gpkg_pfad, self._brb_tabelle, self._verfahrensgebiet_filter,
+            name=f"Verfahrensgebiet {', '.join(self._verfahrensnummern)} (aktueller Stand)",
+            zoomen=True,
+        )
+
+    def _aktuellen_stand_anzeigen(self):
+        tabelle = self._layername_aus_dropdown()
+        if tabelle and self.gpkg_pfad:
+            aktuellen_stand_laden(self.iface, self.gpkg_pfad, tabelle)
 
     def aktueller_layer(self):
         """Intern geoeffnete Tabelle der gewaehlten Objektart (oder None)."""

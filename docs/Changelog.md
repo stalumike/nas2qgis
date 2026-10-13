@@ -7,6 +7,9 @@ Versionierung nach [Semantic Versioning](https://semver.org/lang/de/).
 
 ---
 ## [unrelesead]
+## [2.1.1] 2026-10-13
+- im Reiter Vergleich gibt es jetzt die Schaltfläche Verfahrensgebiet anzeigen, dort wird ein Verfahrensgebiet (wenn in den eingelesenen NBA Daten vorhanden) mit aktuellstem Stand angezeigt
+- Im Reiter Vergleich gibt es die Funktion Aktuellen Stand anzeigen, aus der Klappliste Objektart lässt sich jetzt eine beliebige Objektart zur Ansicht in die Karte laden
 ## [2.1.0] 2026-10-02
 - es wurde ein Fehler behoben der dafür sorgte das untergangene Flurstücke noch als aktiv geführt wurden weil bei einem Replace ein wfs update ignoeriert wurde, jetzt wird bei einem Replace auch ein Update ausgewertet s. #5
 ## [2.0.0] 2026-10-02
